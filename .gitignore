@@ -1,0 +1,33 @@
+# runtime
+bot/state.json
+bot/trades.jsonl
+state.json
+trades.jsonl
+*.jsonl
+
+# secrets / env
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# os / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# local dumps
+/tmp/
+*.log
+.trellis/
