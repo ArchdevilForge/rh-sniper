@@ -39,6 +39,7 @@ Default mode is **dry-run** (quotes only). Real money requires explicit `--live`
 ## Requirements
 
 - Python **3.10+**
+- [`uv`](https://github.com/astral-sh/uv) recommended (or pip)
 - [`gmgn-cli`](https://www.npmjs.com/package/gmgn-cli) installed and configured
 - GMGN API key (and private key for live swaps)
 - Robinhood-chain wallet funded if using `--live`
@@ -50,28 +51,48 @@ gmgn-cli config --check
 
 ---
 
-## Quick start
+## Install
 
 ```bash
 git clone https://github.com/ArchdevilForge/rh-sniper.git
 cd rh-sniper
 
+uv venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
+uv pip install -e .
+
+rh-sniper --help
+rh-sniper doctor
+```
+
+CLI entrypoint: **`rh-sniper`** (Typer). Compat: `python rh_sniper.py`.
+
+---
+
+## Quick start
+
+```bash
 # single dry-run cycle (no funds moved)
-python3 rh_sniper.py --once --profile adff
+rh-sniper run --once -p adff
 
 # continuous dry-run
-python3 rh_sniper.py --profile adff
+rh-sniper run -p adff
 
 # live (real money) — start tiny
-python3 rh_sniper.py --live --profile adff \
+rh-sniper run --live -p adff \
   --buy-eth 0.02 --max-positions 2 --daily-loss-usd 30
+
+# ops
+rh-sniper status
+rh-sniper logs -n 30
+rh-sniper logs -e reject
+rh-sniper reset-state --yes
 ```
 
 Optional wallet override:
 
 ```bash
 export GMGN_WALLET=0xYourWalletBoundToApiKey
-python3 rh_sniper.py --profile adff
+rh-sniper run -p adff
 ```
 
 Runtime files (gitignored):
@@ -96,9 +117,9 @@ Parameter packs from reverse engineering — **style**, not “mirror this addre
 | `417c` | `0.12` ETH | $8k–$50k | Larger size, wider ladder / reheat |
 
 ```bash
-python3 rh_sniper.py --profile adff
-python3 rh_sniper.py --profile 7a23 --min-mc 8000 --max-mc 30000
-python3 rh_sniper.py --profile 417c --buy-eth 0.05
+rh-sniper run -p adff
+rh-sniper run -p 7a23 --min-mc 8000 --max-mc 30000
+rh-sniper run -p 417c --buy-eth 0.05
 ```
 
 ---
@@ -154,10 +175,10 @@ Steady-state target ~**7–12 weight/s** under the 20/s cap.
 
 ```bash
 # recommended
-python3 rh_sniper.py --poll 1 --gate-every 2 --max-gates 2 --mon-sec-every 3
+rh-sniper run --poll 1 --gate-every 2 --max-gates 2 --mon-sec-every 3
 
 # more aggressive (still not full 200ms hard-check spam)
-python3 rh_sniper.py --poll 0.5 --gate-every 3 --max-gates 1
+rh-sniper run --poll 0.5 --gate-every 3 --max-gates 1
 ```
 
 **Do not** set `--poll 0.2` with high `--max-gates` — you will 429 / ban.
@@ -166,9 +187,22 @@ python3 rh_sniper.py --poll 0.5 --gate-every 3 --max-gates 1
 
 ## CLI reference
 
+Built with **Typer** for subcommand management:
+
+| Command | Purpose |
+|---------|---------|
+| `rh-sniper run` | Start sniper (dry-run default) |
+| `rh-sniper status` | Open positions / counters |
+| `rh-sniper logs` | Tail `trades.jsonl` |
+| `rh-sniper doctor` | Check `gmgn-cli` + config |
+| `rh-sniper reset-state` | Clear local state |
+| `rh-sniper version` | Version |
+
+### `run` options
+
 ```text
---profile adff|7a23|417c
---wallet 0x...
+-p / --profile adff|7a23|417c
+-w / --wallet 0x...
 --buy-eth 0.03
 --slippage 30
 --poll 1.0
@@ -209,14 +243,19 @@ Speed alone is not edge. Filter quality + exit discipline + LP risk control matt
 
 ```text
 rh-sniper/
-├── rh_sniper.py      # main bot
+├── rh_sniper/           # package
+│   ├── cli.py           # Typer CLI (run/status/logs/doctor/...)
+│   ├── engine.py        # strategy loop + gates
+│   └── __init__.py
+├── rh_sniper.py         # thin compat launcher
+├── pyproject.toml       # uv/pip install → `rh-sniper` entrypoint
 ├── README.md
-├── LICENSE           # MIT
+├── LICENSE              # MIT
 ├── .env.example
 └── .gitignore
 ```
 
-No extra Python deps — only stdlib + local `gmgn-cli`.
+Python deps: **typer** (+ rich). Trading data path still goes through local **`gmgn-cli`**.
 
 ---
 
