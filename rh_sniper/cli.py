@@ -63,7 +63,7 @@ def run(
     max_creator_open_count: int = typer.Option(20, "--max-creator-open-count", help="0 disables"),
     reject_creator_hold: bool = typer.Option(False, "--reject-creator-hold"),
     enable_fake_heat: bool = typer.Option(True, "--fake-heat/--no-fake-heat"),
-    exit_mode: Optional[str] = typer.Option(None, "--exit-mode", help="principal|sniper|wide (override profile)"),
+    exit_mode: Optional[str] = typer.Option(None, "--exit-mode", help="hf_full|hf_scale|principal|wide (override profile)"),
     hard_sl_pct: Optional[float] = typer.Option(None, "--hard-sl", help="Hard stop-loss percent, e.g. 55"),
     trail_activate_pct: Optional[float] = typer.Option(None, "--trail-activate", help="Activate trailing after +X%"),
     trail_drawdown_pct: Optional[float] = typer.Option(None, "--trail-dd", help="Trailing giveback from peak %"),
@@ -76,8 +76,8 @@ def run(
     """Start the sniper (dry-run unless --live)."""
     if profile not in {"adff", "7a23", "417c"}:
         raise typer.BadParameter("profile must be adff | 7a23 | 417c")
-    if exit_mode and exit_mode not in {"principal", "sniper", "wide"}:
-        raise typer.BadParameter("exit-mode must be principal|sniper|wide")
+    if exit_mode and exit_mode not in {"hf_full", "hf_scale", "principal", "wide"}:
+        raise typer.BadParameter("exit-mode must be hf_full|hf_scale|principal|wide")
     cfg = build_config(
         wallet=wallet,
         profile=profile,

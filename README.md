@@ -131,31 +131,41 @@ Override paths with `RH_SNIPER_STATE` / `RH_SNIPER_LOG`.
 
 Parameter packs from reverse engineering — **style**, not “mirror this address”.
 
-| Profile | Size default | MC band | Exit mode | First take | Hard SL |
-|---------|--------------|---------|-----------|------------|---------|
-| `adff` | `0.03` ETH | $3k–$15k | **principal** | **2x sell 55%** | -30% |
-| `7a23` | `0.06` ETH | $5k–$40k | **principal** | **2x sell 55%** | -35% |
-| `417c` | `0.12` ETH | $8k–$50k | **wide** | 2x sell 50% | **-55%** |
+| Profile | Size | MC band | Exit (HF reverse) | First take | Hard SL | Hold |
+|---------|------|---------|-------------------|------------|---------|------|
+| `adff` | fixed `0.03` ETH | $3k–$15k | **hf_full** | **+20% 卖 100%** | -25% | 120s |
+| `7a23` | risk 1% + **probe** | $5k–$40k | **hf_scale** | **+25% 卖 30%** | -30% | 300s |
+| `417c` | risk 1.25% | $8k–$50k | **hf_scale** | **+30% 卖 25%** | -35% | 3600s |
 
-### Exit research note (from 3 high-PnL RH wallets)
+### HF reverse-engineering (aligned defaults)
 
-On-chain first-sell slice multiples (sell_usd / buy_cost_usd):
+| Wallet | First-sell mult | First-sell size | Style |
+|--------|-----------------|-----------------|--------|
+| `0xadff…` | ~**1.12x** | often **100% clear** | fixed ~$52, thin high-freq |
+| `0x7a23…` | ~**1.17x** | often **~30%** then more | probe + mid size |
+| `0x417c…` | ~**1.47x** | often **~25%** then multi-sell | larger size + residual bag |
 
-| Wallet | First-sell median | Notes |
-|--------|-------------------|--------|
-| `0xadff…` | **~1.12x** | Fixed ~$52 size; often out near principal+ |
-| `0x7a23…` | **~1.17x** | Probe+$50–300; multi-sell common |
-| `0x417c…` | **~1.47x** | Larger ~$260; more multi-sell ladder |
+Big multiples come from **scale-out + residual bag over hours**, not from never selling.
 
-Default bot exit is therefore **principal-out**: first major take around **2x** sells **~55%** (recover cost + small profit), then pyramid + trail. Your **-55% hard SL** is available via `417c` or `--hard-sl 55`.
+### Position management (aligned)
 
-### Position management
+| Style | Rule |
+|-------|------|
+| `adff` | **Fixed size** (not % risk) — like $52 template |
+| `7a23` | **1% bankroll** + default **probe 0.001 ETH** |
+| `417c` | **1.25% bankroll**, higher concurrent notional |
+| All | `--max-open-exposure-pct 15`, `--max-positions`, daily loss halt |
+| Kelly | upper bound only; stay **≤1–2%/trade** |
 
-- `--risk-pct 1` → size as 1% of bankroll (native or `--bankroll-eth`)
-- `--max-buy-eth` hard cap
-- `--max-open-exposure-pct 15` blocks new entries if open notional too large
-- wider SL profiles use **smaller default risk** (`417c` 0.75%)
-- Kelly upper-bound for typical 55% WR systems is huge; retail should stay **≤1–2%/trade**
+### Selection (aligned)
+
+- Chain: **Robinhood**
+- Venue: **noxa / bankr / trench / virtuals / flap**
+- MC band by profile (micro / small / wider reheat)
+- Fresh **or** reheat volume
+- **can_sell + buy/sell quote** (+ optional probe)
+- Fake-heat + creator spam filters
+- Skip naked Uni unless `--allow-uniswap`
 
 ```bash
 rh-sniper run -p adff

@@ -62,7 +62,7 @@ class Config:
     require_can_sell: bool = True
     only_safe_lp: bool = True
     # Exit plan: principal-out first, then pyramid scale-out + trailing
-    exit_mode: str = "principal"  # principal | sniper | wide
+    exit_mode: str = "hf_scale"  # hf_full | hf_scale | principal | wide
     tp1: float = 100          # +100% = 2x
     tp1_pct: float = 55       # sell ~55% (principal + small profit)
     tp2: float = 200
@@ -127,14 +127,23 @@ def condition_orders(cfg: Config) -> str:
     as a dependency graph; we approximate with fixed ladder + trailing remainder.
     """
     sl = int(cfg.hard_sl_pct or cfg.sl or 35)
-    orders = [
-        {"order_type": "profit_stop", "side": "sell", "price_scale": str(int(cfg.tp1)), "sell_ratio": str(int(cfg.tp1_pct))},
-        {"order_type": "profit_stop", "side": "sell", "price_scale": str(int(cfg.tp2)), "sell_ratio": str(int(cfg.tp2_pct))},
-        {"order_type": "profit_stop", "side": "sell", "price_scale": str(int(cfg.tp3)), "sell_ratio": str(int(cfg.tp3_pct))},
-        {"order_type": "loss_stop", "side": "sell", "price_scale": str(sl), "sell_ratio": "100"},
-    ]
-    # remainder after tp1+tp2+tp3
-    sold = int(cfg.tp1_pct) + int(cfg.tp2_pct) + int(cfg.tp3_pct)
+    orders = []
+    for scale, ratio in (
+        (cfg.tp1, cfg.tp1_pct),
+        (cfg.tp2, cfg.tp2_pct),
+        (cfg.tp3, cfg.tp3_pct),
+    ):
+        r = int(ratio)
+        if r <= 0:
+            continue
+        orders.append({
+            "order_type": "profit_stop",
+            "side": "sell",
+            "price_scale": str(int(scale)),
+            "sell_ratio": str(r),
+        })
+    orders.append({"order_type": "loss_stop", "side": "sell", "price_scale": str(sl), "sell_ratio": "100"})
+    sold = sum(int(x) for x in (cfg.tp1_pct, cfg.tp2_pct, cfg.tp3_pct))
     rem = max(0, 100 - sold)
     if cfg.use_trailing and rem > 0:
         orders.append({
@@ -144,9 +153,12 @@ def condition_orders(cfg: Config) -> str:
             "sell_ratio": str(rem),
             "drawdown_rate": str(int(cfg.trail_drawdown_pct)),
         })
-    elif rem > 0:
-        # dump remainder at tp3 if no trail
-        orders[2]["sell_ratio"] = str(int(cfg.tp3_pct) + rem)
+    elif rem > 0 and orders:
+        # add remainder onto last TP leg
+        for o in reversed(orders):
+            if o.get("order_type") == "profit_stop":
+                o["sell_ratio"] = str(int(o["sell_ratio"]) + rem)
+                break
     return json.dumps(orders, separators=(",", ":"))
 
 
@@ -748,17 +760,18 @@ def apply_profile(cfg: Config, name: str, buy_eth_cli: float) -> None:
         cfg.reheat_min_vol_1h = 5000
         cfg.reheat_min_swaps_1h = 20
         cfg.min_liquidity = 1200
-        # principal-out even on micro-cap: first major take at ~2x
-        cfg.exit_mode = "principal"
-        cfg.tp1, cfg.tp1_pct = 100, 55  # 2x sell 55% = principal + small profit
-        cfg.tp2, cfg.tp2_pct = 200, 25
-        cfg.tp3, cfg.tp3_pct = 400, 10
-        cfg.trail_activate_pct = 100
+        # HF reverse of 0xadff: fixed small size, first print ~1.1-1.5x often FULL clear
+        cfg.exit_mode = "hf_full"
+        cfg.tp1, cfg.tp1_pct = 20, 100   # +20% (~1.2x) dump all — matches full-clear peak
+        cfg.tp2, cfg.tp2_pct = 50, 0
+        cfg.tp3, cfg.tp3_pct = 100, 0
+        cfg.trail_activate_pct = 20
         cfg.trail_drawdown_pct = 25
-        cfg.hard_sl_pct = cfg.sl = 30
-        cfg.max_hold_sec = 180
-        cfg.use_default_risk = True
-        cfg.default_risk_pct = 1.0
+        cfg.use_trailing = False
+        cfg.hard_sl_pct = cfg.sl = 25
+        cfg.max_hold_sec = 120
+        cfg.use_default_risk = False  # fixed size like $50 template
+        cfg.default_risk_pct = 0
     elif name == "7a23":
         # 0xDavid: probe-ish mid size, $5-40k MC
         cfg.buy_eth = 0.06 if buy_eth_cli == 0.03 else buy_eth_cli
@@ -767,15 +780,19 @@ def apply_profile(cfg: Config, name: str, buy_eth_cli: float) -> None:
         cfg.reheat_min_vol_1h = 8000
         cfg.reheat_min_swaps_1h = 30
         cfg.min_liquidity = 2000
-        # principal-out classic: first major take near 2x
-        cfg.exit_mode = "principal"
-        cfg.tp1, cfg.tp1_pct = 100, 55  # 2x sell 55% ~ principal + small profit
-        cfg.tp2, cfg.tp2_pct = 200, 25
-        cfg.tp3, cfg.tp3_pct = 400, 10
-        cfg.trail_activate_pct = 100
+        # HF reverse of 0x7a23: probe + mid size; 1.1-1.5x sell ~30% then ladder; leave runner
+        cfg.exit_mode = "hf_scale"
+        cfg.tp1, cfg.tp1_pct = 25, 30    # ~1.25x sell 30% of bag
+        cfg.tp2, cfg.tp2_pct = 50, 30    # ~1.5x sell another 30%
+        cfg.tp3, cfg.tp3_pct = 100, 25   # 2x sell 25%
+        # remainder 15% trailing
+        cfg.trail_activate_pct = 50
         cfg.trail_drawdown_pct = 20
-        cfg.hard_sl_pct = cfg.sl = 35
+        cfg.use_trailing = True
+        cfg.hard_sl_pct = cfg.sl = 30
         cfg.max_hold_sec = 300
+        if cfg.probe_eth <= 0:
+            cfg.probe_eth = 0.001  # 0xDavid-style probe default
         cfg.use_default_risk = True
         cfg.default_risk_pct = 1.0
     elif name == "417c":
@@ -786,17 +803,19 @@ def apply_profile(cfg: Config, name: str, buy_eth_cli: float) -> None:
         cfg.reheat_min_vol_1h = 12000
         cfg.reheat_min_swaps_1h = 40
         cfg.min_liquidity = 3000
-        # wide: user-style deeper SL + later pyramid
-        cfg.exit_mode = "wide"
-        cfg.tp1, cfg.tp1_pct = 100, 50
-        cfg.tp2, cfg.tp2_pct = 200, 25
-        cfg.tp3, cfg.tp3_pct = 400, 15
-        cfg.trail_activate_pct = 150
-        cfg.trail_drawdown_pct = 15
-        cfg.hard_sl_pct = cfg.sl = 55  # 55% hard SL
-        cfg.max_hold_sec = 600
+        # HF reverse of 0x417c: larger size; 1.1-1.5x sell ~25% then multi-sell ladder + residual bag
+        cfg.exit_mode = "hf_scale"
+        cfg.tp1, cfg.tp1_pct = 30, 25    # ~1.3x sell 25%
+        cfg.tp2, cfg.tp2_pct = 80, 30    # ~1.8x sell 30%
+        cfg.tp3, cfg.tp3_pct = 150, 25   # 2.5x sell 25%
+        # remainder 20% trail for multi-hour runners
+        cfg.trail_activate_pct = 80
+        cfg.trail_drawdown_pct = 25
+        cfg.use_trailing = True
+        cfg.hard_sl_pct = cfg.sl = 35
+        cfg.max_hold_sec = 3600  # can hold runners longer
         cfg.use_default_risk = True
-        cfg.default_risk_pct = 0.75  # wider SL => smaller risk
+        cfg.default_risk_pct = 1.25
 
 
 def build_config(
