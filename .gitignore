@@ -35,3 +35,9 @@ build/
 /tmp/
 *.log
 .trellis/
+
+# runtime dry/live
+state.dry.json
+state.live.json
+trades.dry.jsonl
+trades.live.jsonl
