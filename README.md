@@ -7,10 +7,12 @@ Robinhood-chain meme sniper via [GMGN OpenAPI](https://gmgn.ai) (`gmgn-cli`).
 It encodes the common playbook reverse-engineered from high-PnL Robinhood wallets:
 
 ```
-safe_lp + mc_in_range + min_liq + (fresh OR reheat) + can_sell
-  → fixed-size buy
-  → ladder TP / SL (GMGN condition-orders)
-  → LP-pull emergency dump
+safe_lp + mc_in_range + min_liq + (fresh OR reheat)
+  + can_sell + buy_quote + sell_quote
+  + fake_heat/creator filters
+  → optional probe buy/sell
+  → sized buy (fixed or risk%)
+  → ladder TP/SL + LP/creator dump emergency exit
 ```
 
 Default mode is **dry-run** (quotes only). Real money requires explicit `--live`.
@@ -25,14 +27,25 @@ Default mode is **dry-run** (quotes only). Real money requires explicit `--live`
   - Safe launchpads: `noxa` / `bankr` / `trench` / `virtuals` / `flap`
   - Market-cap band by profile
   - Fresh open window **or** reheat (1h volume / swaps)
-  - `can_sell` / honeypot / tax / top10 / live quote gate
+  - `can_sell` / honeypot / tax / top10
+  - **Buy quote + sell quote** (sell-side route must exist)
+  - **Fake-heat filters** (wash-ish / LPI-ish liq-mc extremes)
+  - **Creator spam / hold filters**
+- **Probe mode** (`--probe-eth`)
+  - Tiny buy+sell (or dual quote in dry-run) before full size
+- **Sizing**
+  - Fixed `--buy-eth` or `--risk-pct` of native balance (capped)
 - **Exits**
-  - Ladder take-profit + hard stop via `--condition-orders`
-  - **LP monitor**: dump 100% if liquidity drops hard, floor breaks, or max hold hit
-- **Rate-limit aware loop** (GMGN leaky bucket `rate=20/s`)
-  - Fast loop: trenches scan + light position liquidity check
-  - Slow gate: hard-check only a few candidates
-- **Profiles** inspired by reversed styles: `adff` / `7a23` / `417c`
+  - Ladder take-profit + hard stop via condition-orders
+  - **LP monitor** + creator inventory dump + max hold → market dump
+  - Emergency slippage tier separate from normal entry slippage
+- **Live safety**
+  - `--live` blocked if gmgn config fails or RH native balance too low
+  - Optional `--anti-mev` on swaps
+- **Ops CLI**
+  - `run` / `status` / `logs` / `stats` / `doctor` / `reset-state`
+- **Rate-limit aware dual loop** (GMGN leaky bucket `rate=20/s`)
+- **Profiles**: `adff` / `7a23` / `417c`
 
 ---
 
@@ -74,17 +87,23 @@ CLI entrypoint: **`rh-sniper`** (Typer). Compat: `python rh_sniper.py`.
 # single dry-run cycle (no funds moved)
 rh-sniper run --once -p adff
 
-# continuous dry-run
-rh-sniper run -p adff
+# recommended dry-run with probe quotes + sell-side check
+rh-sniper run -p adff --probe-eth 0.001
 
-# live (real money) — start tiny
+# live (real money) — start tiny; blocked if RH balance too low
 rh-sniper run --live -p adff \
-  --buy-eth 0.02 --max-positions 2 --daily-loss-usd 30
+  --buy-eth 0.02 --probe-eth 0.001 \
+  --max-positions 2 --daily-loss-usd 30
+
+# size as 2% of native, hard-capped
+rh-sniper run -p adff --risk-pct 2 --max-buy-eth 0.05
 
 # ops
+rh-sniper doctor
 rh-sniper status
 rh-sniper logs -n 30
 rh-sniper logs -e reject
+rh-sniper stats
 rh-sniper reset-state --yes
 ```
 
@@ -128,16 +147,31 @@ rh-sniper run -p 417c --buy-eth 0.05
 
 A candidate must pass:
 
-1. **safe_lp** — launchpad in allowlist (use `--allow-uniswap` only if you accept naked pool risk)
+1. **safe_lp** — launchpad in allowlist (`--allow-uniswap` only if you accept naked pool risk)
 2. **mc_in_range** — live market cap inside profile band
 3. **min_liq** — liquidity floor
-4. **timing**
-   - `fresh`: open/create age ≤ `fresh_max_age`
-   - `reheat`: older token but 1h volume/swaps above threshold
-5. **can_sell** / not honeypot / tax not insane / top10 not extreme
-6. **buy quote** must route
+4. **timing** — `fresh` or `reheat`
+5. **can_sell** / not honeypot / tax / top10
+6. **fake_heat** — reject wash-ish volume / extreme liq-mc ratios / one-way buy volume
+7. **creator** — optional spam / still-holding filters
+8. **buy quote** must route
+9. **sell quote** must route (token → native on ~50% of estimated out)
+10. optional **probe** — tiny buy+sell (live) or dual quote (dry-run)
 
-Then: fixed-size buy + ladder condition orders.
+Then: sized buy + ladder condition orders.
+
+## Risk system (why most snipers die)
+
+| Failure | Mitigation in rh-sniper |
+|---------|-------------------------|
+| LP pull | entry liq floor + live LP drop dump |
+| Honeypot / unsellable | `can_sell` + **sell quote** + optional **probe** |
+| Fake heat (wash / LPI) | vol/price + liq/mc filters |
+| Creator serial rugs | `max_creator_open_count`, hold filter, creator dump mon |
+| Oversize | `risk_pct` + caps + `max_positions` + daily loss halt |
+| Live with empty wallet | `doctor` + live preflight |
+| Rate-limit ban | dual-speed loop |
+| MEV | `--anti-mev` on swaps |
 
 ---
 
@@ -194,7 +228,8 @@ Built with **Typer** for subcommand management:
 | `rh-sniper run` | Start sniper (dry-run default) |
 | `rh-sniper status` | Open positions / counters |
 | `rh-sniper logs` | Tail `trades.jsonl` |
-| `rh-sniper doctor` | Check `gmgn-cli` + config |
+| `rh-sniper stats` | Reject/buy/probe/exit summary |
+| `rh-sniper doctor` | Check `gmgn-cli` + config + RH balance |
 | `rh-sniper reset-state` | Clear local state |
 | `rh-sniper version` | Version |
 
@@ -204,6 +239,15 @@ Built with **Typer** for subcommand management:
 -p / --profile adff|7a23|417c
 -w / --wallet 0x...
 --buy-eth 0.03
+--risk-pct 0            # 2 = 2% of native; 0 = use buy-eth
+--max-buy-eth 0
+--probe-eth 0           # >0 enables probe path
+--require-sell-quote / --no-sell-quote
+--anti-mev / --no-anti-mev
+--fake-heat / --no-fake-heat
+--max-creator-open-count 20
+--reject-creator-hold
+--min-wallet-eth 0.01   # live gate
 --slippage 30
 --poll 1.0
 --gate-every 2

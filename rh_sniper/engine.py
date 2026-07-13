@@ -1,17 +1,5 @@
 #!/usr/bin/env python3
-"""Robinhood sniper — strategy replica, NOT copy-trade.
-
-Entry rules reverse-engineered from high-PnL RH wallets:
-  safe_lp + mc_in_range + min_liq + (fresh OR reheat) + can_sell
-  fixed size, ladder TP/SL, LP-pull emergency dump.
-
-Default dry-run. --live submits real swaps.
-
-API budget (leaky bucket rate=20/s capacity=20):
-  fast loop  ~1.0s: trenches(3) + mon liq-only(1/pos)
-  slow gate  every N fast loops: hard-check at most K candidates (info+sec+quote≈4 each)
-  swap: event-driven only
-"""
+"""Robinhood sniper engine — strategy replica + P0/P1 risk system."""
 
 from __future__ import annotations
 
@@ -23,7 +11,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 NATIVE = "0x0000000000000000000000000000000000000000"
-# Runtime artifacts default to process cwd (not site-packages). Override via env.
 STATE_PATH = Path(os.environ.get("RH_SNIPER_STATE", "state.json")).expanduser()
 LOG_PATH = Path(os.environ.get("RH_SNIPER_LOG", "trades.jsonl")).expanduser()
 SAFE_LP = ("noxa", "bankr", "trench", "virtuals", "flap")
@@ -53,16 +40,14 @@ class Config:
     buy_eth: float = 0.03
     slippage: int = 30
     emergency_slippage: int = 50
-    poll_sec: float = 1.0  # fast loop: scan + light mon
-    gate_every: int = 2  # hard-check candidates every N fast loops
-    max_gates_per_tick: int = 2  # hard-checks per gate tick (each ~weight 4)
-    mon_security_every: int = 3  # full security on positions every N fast loops
-    # age windows
-    fresh_max_age_sec: int = 600  # brand-new / just opened
-    reheat_max_age_sec: int = 7 * 24 * 3600  # allow older noxa if reheat
+    poll_sec: float = 1.0
+    gate_every: int = 2
+    max_gates_per_tick: int = 2
+    mon_security_every: int = 3
+    fresh_max_age_sec: int = 600
+    reheat_max_age_sec: int = 7 * 24 * 3600
     reheat_min_vol_1h: float = 8000.0
     reheat_min_swaps_1h: int = 30
-    # size / risk filters from reverse eng
     min_mc: float = 3000.0
     max_mc: float = 15000.0
     min_liquidity: float = 1500.0
@@ -71,13 +56,11 @@ class Config:
     min_holders: int = 5
     max_positions: int = 3
     daily_loss_usd: float = 100.0
-    # LP rug
     lp_drop_pct: float = 35.0
     min_liq_hold: float = 800.0
     max_hold_sec: int = 300
     require_can_sell: bool = True
     only_safe_lp: bool = True
-    # ladder
     tp1: float = 15
     tp1_pct: float = 50
     tp2: float = 40
@@ -88,6 +71,20 @@ class Config:
     live: bool = False
     once: bool = False
     paper_positions: bool = True
+    require_sell_quote: bool = True
+    probe_eth: float = 0.0
+    risk_pct: float = 0.0
+    max_buy_eth: float = 0.0
+    min_wallet_eth: float = 0.01
+    require_live_balance: bool = True
+    anti_mev: bool = True
+    max_liq_mc_ratio: float = 2.0
+    min_liq_mc_ratio: float = 0.02
+    max_creator_open_count: int = 20
+    reject_creator_hold: bool = False
+    fake_heat_min_vol_1h: float = 20000.0
+    fake_heat_max_price_change_1h: float = 0.05
+    enable_fake_heat: bool = True
 
 
 def load_state() -> dict:
@@ -119,8 +116,64 @@ def eth_to_wei(eth: float) -> str:
     return str(int(eth * 1e18))
 
 
+def quote(cfg: Config, input_token: str, output_token: str, amount_wei: str, slippage: int | None = None) -> dict:
+    return sh([
+        "gmgn-cli", "order", "quote",
+        "--chain", cfg.chain, "--from", cfg.wallet,
+        "--input-token", input_token, "--output-token", output_token,
+        "--amount", amount_wei,
+        "--slippage", str(slippage if slippage is not None else cfg.slippage),
+        "--raw",
+    ]) or {}
+
+
+def native_balance_eth(cfg: Config) -> float:
+    info = sh(["gmgn-cli", "portfolio", "info", "--raw"]) or {}
+    wallet = (cfg.wallet or "").lower()
+    for w in info.get("wallets") or []:
+        if (w.get("chain") or "").lower() != cfg.chain.lower():
+            continue
+        if wallet and (w.get("address") or "").lower() != wallet:
+            continue
+        for b in w.get("balances") or []:
+            if (b.get("token_address") or "").lower() in ("", NATIVE.lower()):
+                return fnum(b.get("balance"))
+    for w in info.get("wallets") or []:
+        if (w.get("chain") or "").lower() != cfg.chain.lower():
+            continue
+        for b in w.get("balances") or []:
+            if (b.get("token_address") or "").lower() in ("", NATIVE.lower()):
+                return fnum(b.get("balance"))
+    return 0.0
+
+
+def resolve_buy_eth(cfg: Config) -> float:
+    if cfg.risk_pct and cfg.risk_pct > 0:
+        bal = native_balance_eth(cfg)
+        pct = cfg.risk_pct / 100.0 if cfg.risk_pct >= 1 else cfg.risk_pct
+        size = bal * pct
+        cap = cfg.max_buy_eth if cfg.max_buy_eth > 0 else cfg.buy_eth
+        if cap > 0:
+            size = min(size, cap)
+        return max(size, 0.0)
+    return max(cfg.buy_eth, 0.0)
+
+
+def live_preflight(cfg: Config) -> tuple[bool, str]:
+    if not cfg.live:
+        return True, "dry-run"
+    p = subprocess.run(["gmgn-cli", "config", "--check"], capture_output=True, text=True)
+    if p.returncode != 0:
+        return False, f"gmgn_config_fail:{(p.stderr or p.stdout)[:200]}"
+    if cfg.require_live_balance:
+        bal = native_balance_eth(cfg)
+        need = max(cfg.min_wallet_eth, resolve_buy_eth(cfg) * 1.2)
+        if bal < need:
+            return False, f"insufficient_native bal={bal:.6f} need>={need:.6f}"
+    return True, "ok"
+
+
 def estimate_mc(token_row: dict, info: dict | None = None) -> float:
-    """Prefer trenches usd_market_cap; else price * supply from info."""
     mc = fnum(token_row.get("usd_market_cap") or token_row.get("market_cap"))
     if mc > 0:
         return mc
@@ -129,26 +182,54 @@ def estimate_mc(token_row: dict, info: dict | None = None) -> float:
     price_obj = info.get("price")
     price = fnum(price_obj.get("price")) if isinstance(price_obj, dict) else fnum(price_obj)
     supply = fnum(info.get("circulating_supply") or info.get("total_supply"))
-    if price > 0 and supply > 0:
-        return price * supply
-    # RH memes often 1B supply — last resort only if price known from trench
-    return 0.0
+    return price * supply if price > 0 and supply > 0 else 0.0
 
 
 def activity_1h(info: dict | None, token_row: dict) -> tuple[float, int]:
-    """Return (volume_1h, swaps_1h)."""
-    vol = fnum(token_row.get("volume_1h") or token_row.get("volume_24h") and 0)
+    vol = fnum(token_row.get("volume_1h") or 0)
     swaps = int(token_row.get("swaps_1h") or token_row.get("swaps_24h") or 0)
-    if info:
-        price = info.get("price") if isinstance(info.get("price"), dict) else {}
+    if info and isinstance(info.get("price"), dict):
+        price = info["price"]
         vol = fnum(price.get("volume_1h") or price.get("volume_5m") or vol)
         swaps = int(price.get("swaps_1h") or price.get("swaps_5m") or swaps)
-        # if only 24h present, don't treat as reheat signal alone
     return vol, swaps
 
 
+def fake_heat_reject(cfg: Config, snap: dict) -> str | None:
+    if not cfg.enable_fake_heat:
+        return None
+    mc, liq = fnum(snap.get("mc")), fnum(snap.get("liquidity"))
+    if mc > 0 and liq > 0:
+        ratio = liq / mc
+        if ratio > cfg.max_liq_mc_ratio:
+            return f"liq_mc_high:{ratio:.2f}"
+        if ratio < cfg.min_liq_mc_ratio:
+            return f"liq_mc_low:{ratio:.4f}"
+    vol = fnum(snap.get("vol_1h"))
+    ret = snap.get("ret_1h")
+    if vol >= cfg.fake_heat_min_vol_1h and ret is not None and abs(ret) <= cfg.fake_heat_max_price_change_1h:
+        return f"washish vol1h={vol:.0f} ret1h={ret:.3f}"
+    bv, sv = fnum(snap.get("buy_vol_1h")), fnum(snap.get("sell_vol_1h"))
+    if bv >= cfg.fake_heat_min_vol_1h and sv < bv * 0.02:
+        return f"one_way_buy bv={bv:.0f} sv={sv:.0f}"
+    return None
+
+
+def creator_reject(cfg: Config, snap: dict) -> str | None:
+    if cfg.max_creator_open_count > 0:
+        n = int(snap.get("creator_open_count") or 0)
+        if n > cfg.max_creator_open_count:
+            return f"creator_spam open_count={n}"
+    if cfg.reject_creator_hold:
+        st = (snap.get("creator_token_status") or "").lower()
+        if "hold" in st and "close" not in st:
+            return f"creator_hold:{st}"
+        if fnum(snap.get("creator_token_balance")) > 0 and "close" not in st:
+            return f"creator_bal:{snap.get('creator_token_balance')}"
+    return None
+
+
 def token_snapshot(cfg: Config, address: str, token_row: dict | None = None, with_security: bool = True) -> dict:
-    """info always; security optional (saves weight on fast mon ticks)."""
     token_row = token_row or {}
     info = sh(["gmgn-cli", "token", "info", "--chain", cfg.chain, "--address", address, "--raw"])
     sec: dict = {}
@@ -183,7 +264,6 @@ def token_snapshot(cfg: Config, address: str, token_row: dict | None = None, wit
     open_age = (now - opened) if opened > 0 else None
     create_age = (now - created) if created > 0 else None
     age = open_age if open_age is not None else create_age
-
     mc = estimate_mc(token_row, info)
     vol_1h, swaps_1h = activity_1h(info, token_row)
     lp = (
@@ -193,7 +273,11 @@ def token_snapshot(cfg: Config, address: str, token_row: dict | None = None, wit
         or token_row.get("launchpad_platform")
         or ""
     ).lower()
-
+    dev = (info or {}).get("dev") or {}
+    price = (info or {}).get("price") if isinstance((info or {}).get("price"), dict) else {}
+    px = fnum(price.get("price"))
+    px_1h = fnum(price.get("price_1h"))
+    ret_1h = ((px - px_1h) / px_1h) if px_1h > 0 and px > 0 else None
     return {
         "liquidity": liq,
         "can_sell": sellable,
@@ -213,55 +297,47 @@ def token_snapshot(cfg: Config, address: str, token_row: dict | None = None, wit
         "age": age,
         "raw_sec": {k: sec.get(k) for k in ("can_sell", "can_not_sell", "is_honeypot", "buy_tax", "sell_tax")},
         "with_security": with_security,
+        "creator_address": (dev.get("creator_address") or "").lower(),
+        "creator_token_status": dev.get("creator_token_status") or "",
+        "creator_token_balance": fnum(dev.get("creator_token_balance")),
+        "creator_open_count": int(dev.get("creator_open_count") or 0),
+        "price": px,
+        "ret_1h": ret_1h,
+        "buy_vol_1h": fnum(price.get("buy_volume_1h")),
+        "sell_vol_1h": fnum(price.get("sell_volume_1h")),
     }
 
 
 def classify_entry(cfg: Config, snap: dict) -> tuple[str | None, str]:
-    """Return (mode, reason). mode in {fresh, reheat} or None if reject."""
     age = snap.get("age")
     create_age = snap.get("create_age")
     open_age = snap.get("open_age")
-
-    # fresh: just opened or just created
     fresh_age = open_age if open_age is not None else create_age
     if fresh_age is not None and fresh_age <= cfg.fresh_max_age_sec:
-        # also allow open_age negative-ish? opened in future clock skew: treat as fresh
         return "fresh", f"age={fresh_age}s"
-
-    # pre-open bonding: created recently but open_timestamp 0/old
     if open_age is None and create_age is not None and create_age <= cfg.fresh_max_age_sec * 2:
         return "fresh", f"preopen_create_age={create_age}s"
-
-    # reheat: older token with real 1h activity (二次启动)
     if age is not None and age <= cfg.reheat_max_age_sec:
         if snap["vol_1h"] >= cfg.reheat_min_vol_1h or snap["swaps_1h"] >= cfg.reheat_min_swaps_1h:
             return "reheat", f"age={age}s vol1h={snap['vol_1h']:.0f} swaps1h={snap['swaps_1h']}"
-
     return None, f"stale age={age} vol1h={snap.get('vol_1h')} swaps1h={snap.get('swaps_1h')}"
 
 
 def pre_entry_gate(cfg: Config, token: dict) -> tuple[bool, str, dict]:
-    """Hard rules: safe_lp + mc_range + min_liq + (fresh|reheat) + can_sell + quote."""
     addr = token["address"]
     lp = (token.get("_lp") or token.get("launchpad") or token.get("launchpad_platform") or "").lower()
     if cfg.only_safe_lp and not any(x in lp for x in SAFE_LP):
         return False, f"unsafe_lp:{lp or 'unknown'}", {}
-
-    # cheap trench-level MC prefilter if present
     mc0 = fnum(token.get("usd_market_cap") or token.get("market_cap"))
     if mc0 > 0 and (mc0 < cfg.min_mc * 0.5 or mc0 > cfg.max_mc * 2):
         return False, f"mc_trench_out:{mc0:.0f}", {}
-
     try:
         snap = token_snapshot(cfg, addr, token)
     except Exception as e:
         return False, f"snapshot_fail:{e}", {}
-
-    # merge lp from snap if trench missing
     lp = snap["launchpad"] or lp
     if cfg.only_safe_lp and not any(x in lp for x in SAFE_LP):
         return False, f"unsafe_lp_live:{lp or 'unknown'}", snap
-
     if snap["honeypot"]:
         return False, "honeypot", snap
     if cfg.require_can_sell and snap["raw_sec"].get("can_sell") in (False, 0, "0", "no"):
@@ -272,66 +348,51 @@ def pre_entry_gate(cfg: Config, token: dict) -> tuple[bool, str, dict]:
         return False, f"tax:{snap['buy_tax']}/{snap['sell_tax']}", snap
     if snap["top10"] > cfg.max_top10 > 0:
         return False, f"top10:{snap['top10']}", snap
-
+    fh = fake_heat_reject(cfg, snap)
+    if fh:
+        return False, f"fake_heat:{fh}", snap
+    cr = creator_reject(cfg, snap)
+    if cr:
+        return False, cr, snap
     mc = snap["mc"]
     if mc <= 0:
         return False, "mc_unknown", snap
     if mc < cfg.min_mc or mc > cfg.max_mc:
         return False, f"mc_out:{mc:.0f} not_in[{cfg.min_mc:.0f},{cfg.max_mc:.0f}]", snap
-
     mode, why = classify_entry(cfg, snap)
     if not mode:
         return False, f"timing:{why}", snap
     snap["entry_mode"] = mode
     snap["entry_why"] = why
-
+    buy_eth = resolve_buy_eth(cfg)
+    if buy_eth <= 0:
+        return False, "buy_size_zero", snap
+    snap["buy_eth"] = buy_eth
+    amount = eth_to_wei(buy_eth)
     try:
-        sh(
-            [
-                "gmgn-cli",
-                "order",
-                "quote",
-                "--chain",
-                cfg.chain,
-                "--from",
-                cfg.wallet,
-                "--input-token",
-                NATIVE,
-                "--output-token",
-                addr,
-                "--amount",
-                eth_to_wei(cfg.buy_eth),
-                "--slippage",
-                str(cfg.slippage),
-                "--raw",
-            ]
-        )
+        bq = quote(cfg, NATIVE, addr, amount, cfg.slippage)
+        snap["buy_quote_out"] = bq.get("output_amount")
     except Exception as e:
         return False, f"no_buy_route:{e}", snap
-
+    if cfg.require_sell_quote:
+        out_amt = str(bq.get("output_amount") or "0")
+        if out_amt in ("0", "", "None"):
+            return False, "buy_quote_zero_out", snap
+        try:
+            sell_amt = str(max(int(int(out_amt) * 0.5), 1))
+            quote(cfg, addr, NATIVE, sell_amt, cfg.slippage)
+        except Exception as e:
+            return False, f"no_sell_route:{e}", snap
     return True, f"ok:{mode}", snap
 
 
 def fetch_candidates(cfg: Config) -> list[dict]:
-    """Pull trenches wide; hard filters happen in pre_entry_gate (MC/reheat need live info)."""
-    data = sh(
-        [
-            "gmgn-cli",
-            "market",
-            "trenches",
-            "--chain",
-            cfg.chain,
-            "--type",
-            "new_creation",
-            "--type",
-            "completed",
-            "--type",
-            "near_completion",
-            "--limit",
-            "50",
-            "--raw",
-        ]
-    )
+    data = sh([
+        "gmgn-cli", "market", "trenches",
+        "--chain", cfg.chain,
+        "--type", "new_creation", "--type", "completed", "--type", "near_completion",
+        "--limit", "50", "--raw",
+    ])
     now = int(time.time())
     out: list[dict] = []
     if not isinstance(data, dict):
@@ -351,7 +412,6 @@ def fetch_candidates(cfg: Config) -> list[dict]:
             age = open_age if open_age is not None else create_age
             if age is None:
                 continue
-            # keep fresh OR potentially reheat (older but not ancient beyond reheat window)
             is_fresh = age <= cfg.fresh_max_age_sec or (create_age is not None and create_age <= cfg.fresh_max_age_sec)
             is_reheat_cand = age <= cfg.reheat_max_age_sec and (
                 fnum(t.get("volume_1h") or t.get("volume_24h")) >= cfg.reheat_min_vol_1h * 0.25
@@ -363,7 +423,6 @@ def fetch_candidates(cfg: Config) -> list[dict]:
             if fnum(t.get("rug_ratio")) > cfg.max_rug:
                 continue
             mc = fnum(t.get("usd_market_cap") or t.get("market_cap"))
-            # soft MC band — hard band in gate after live price
             if mc > 0 and (mc < cfg.min_mc * 0.3 or mc > cfg.max_mc * 3):
                 continue
             t["_age"] = age
@@ -371,91 +430,80 @@ def fetch_candidates(cfg: Config) -> list[dict]:
             t["_lp"] = lp
             t["_fresh"] = is_fresh
             out.append(t)
-    # prefer fresh, then higher volume, then younger
     out.sort(key=lambda x: (0 if x.get("_fresh") else 1, -fnum(x.get("volume_1h") or x.get("volume_24h")), x.get("_age", 1e18)))
     return out
 
 
-def buy(cfg: Config, token: str, symbol: str) -> dict:
-    amount = eth_to_wei(cfg.buy_eth)
+def buy(cfg: Config, token: str, symbol: str, buy_eth: float | None = None) -> dict:
+    size = buy_eth if buy_eth is not None else resolve_buy_eth(cfg)
+    amount = eth_to_wei(size)
     cond = condition_orders(cfg)
     if not cfg.live:
-        q = sh(
-            [
-                "gmgn-cli",
-                "order",
-                "quote",
-                "--chain",
-                cfg.chain,
-                "--from",
-                cfg.wallet,
-                "--input-token",
-                NATIVE,
-                "--output-token",
-                token,
-                "--amount",
-                amount,
-                "--slippage",
-                str(cfg.slippage),
-                "--raw",
-            ]
-        )
-        return {"mode": "dry-run", "symbol": symbol, "token": token, "amount_wei": amount, "quote_ok": bool(q)}
-    res = sh(
-        [
-            "gmgn-cli",
-            "swap",
-            "--chain",
-            cfg.chain,
-            "--from",
-            cfg.wallet,
-            "--input-token",
-            NATIVE,
-            "--output-token",
-            token,
-            "--amount",
-            amount,
-            "--slippage",
-            str(cfg.slippage),
-            "--condition-orders",
-            cond,
-            "--sell-ratio-type",
-            "buy_amount",
-            "--raw",
-        ],
-        timeout=90,
-    )
-    return {"mode": "live", "symbol": symbol, "token": token, "result": res}
+        q = quote(cfg, NATIVE, token, amount, cfg.slippage)
+        return {"mode": "dry-run", "symbol": symbol, "token": token, "buy_eth": size, "amount_wei": amount, "quote_ok": bool(q), "quote_out": q.get("output_amount")}
+    cmd = [
+        "gmgn-cli", "swap", "--chain", cfg.chain, "--from", cfg.wallet,
+        "--input-token", NATIVE, "--output-token", token, "--amount", amount,
+        "--slippage", str(cfg.slippage), "--condition-orders", cond, "--sell-ratio-type", "buy_amount",
+    ]
+    if cfg.anti_mev:
+        cmd.append("--anti-mev")
+    cmd.append("--raw")
+    return {"mode": "live", "symbol": symbol, "token": token, "buy_eth": size, "result": sh(cmd, timeout=90)}
 
 
 def emergency_sell(cfg: Config, token: str, symbol: str, reason: str) -> dict:
     if not cfg.live:
         return {"mode": "dry-run", "event": "emergency_sell", "symbol": symbol, "token": token, "reason": reason}
-    res = sh(
-        [
-            "gmgn-cli",
-            "swap",
-            "--chain",
-            cfg.chain,
-            "--from",
-            cfg.wallet,
-            "--input-token",
-            token,
-            "--output-token",
-            NATIVE,
-            "--percent",
-            "100",
-            "--slippage",
-            str(cfg.emergency_slippage),
-            "--raw",
-        ],
-        timeout=90,
-    )
-    return {"mode": "live", "event": "emergency_sell", "symbol": symbol, "token": token, "reason": reason, "result": res}
+    cmd = [
+        "gmgn-cli", "swap", "--chain", cfg.chain, "--from", cfg.wallet,
+        "--input-token", token, "--output-token", NATIVE, "--percent", "100",
+        "--slippage", str(cfg.emergency_slippage),
+    ]
+    if cfg.anti_mev:
+        cmd.append("--anti-mev")
+    cmd.append("--raw")
+    return {"mode": "live", "event": "emergency_sell", "symbol": symbol, "token": token, "reason": reason, "result": sh(cmd, timeout=90)}
+
+
+def probe_trade(cfg: Config, token: str, symbol: str) -> tuple[bool, str, dict]:
+    if cfg.probe_eth <= 0:
+        return True, "probe_off", {}
+    amt = eth_to_wei(cfg.probe_eth)
+    meta: dict = {"probe_eth": cfg.probe_eth, "symbol": symbol, "token": token}
+    try:
+        bq = quote(cfg, NATIVE, token, amt, cfg.slippage)
+        out = str(bq.get("output_amount") or "0")
+        if out in ("0", ""):
+            return False, "probe_buy_quote_zero", meta
+        quote(cfg, token, NATIVE, out, cfg.emergency_slippage)
+    except Exception as e:
+        return False, f"probe_quote_fail:{e}", meta
+    if not cfg.live:
+        meta["mode"] = "dry-run"
+        return True, "probe_quote_ok", meta
+    try:
+        buy_cmd = ["gmgn-cli", "swap", "--chain", cfg.chain, "--from", cfg.wallet, "--input-token", NATIVE, "--output-token", token, "--amount", amt, "--slippage", str(cfg.slippage)]
+        if cfg.anti_mev:
+            buy_cmd.append("--anti-mev")
+        buy_cmd.append("--raw")
+        meta["buy_result"] = sh(buy_cmd, timeout=90)
+        sell_cmd = ["gmgn-cli", "swap", "--chain", cfg.chain, "--from", cfg.wallet, "--input-token", token, "--output-token", NATIVE, "--percent", "100", "--slippage", str(cfg.emergency_slippage)]
+        if cfg.anti_mev:
+            sell_cmd.append("--anti-mev")
+        sell_cmd.append("--raw")
+        meta["sell_result"] = sh(sell_cmd, timeout=90)
+        meta["mode"] = "live"
+        return True, "probe_ok", meta
+    except Exception as e:
+        try:
+            emergency_sell(cfg, token, symbol, "probe_fail_cleanup")
+        except Exception:
+            pass
+        return False, f"probe_live_fail:{e}", meta
 
 
 def monitor_positions(cfg: Config, st: dict, with_security: bool = False) -> None:
-    """Fast mon = liq only (weight 1/pos). Occasional security for can_sell/honeypot."""
     pos = st.get("positions") or {}
     if not pos:
         return
@@ -481,14 +529,17 @@ def monitor_positions(cfg: Config, st: dict, with_security: bool = False) -> Non
             reason = f"liq_floor_{liq:.0f}"
         elif held >= cfg.max_hold_sec:
             reason = f"max_hold_{held}s"
-        print(
-            f"[mon] {sym} held={held}s liq={liq:.0f} entry={entry_liq:.0f} drop={drop:.1f}% "
-            f"sec={int(with_security)} can_sell={snap['can_sell']}",
-            flush=True,
-        )
+        entry_cbal = fnum(meta.get("creator_token_balance"))
+        cbal = fnum(snap.get("creator_token_balance"))
+        if with_security and entry_cbal > 0 and cbal < entry_cbal * 0.5:
+            reason = reason or f"creator_dump {entry_cbal:.0f}->{cbal:.0f}"
+        print(f"[mon] {sym} held={held}s liq={liq:.0f} entry={entry_liq:.0f} drop={drop:.1f}% sec={int(with_security)} can_sell={snap['can_sell']}", flush=True)
         if not reason:
             meta["last_liq"] = liq
             meta["last_check"] = int(time.time())
+            if with_security:
+                meta["creator_token_balance"] = cbal
+                meta["creator_token_status"] = snap.get("creator_token_status")
             continue
         print(f"[RUG_EXIT] {sym} reason={reason}", flush=True)
         try:
@@ -518,30 +569,15 @@ def rollover_day(st: dict) -> None:
 def loop(cfg: Config) -> None:
     st = load_state()
     tick = 0
-    # rough steady budget log: trenches3 + mon1*N + gate*(4*K)/gate_every
     est = 3 + cfg.max_positions + (4 * cfg.max_gates_per_tick) / max(cfg.gate_every, 1)
-    print(
-        f"[start] profile={cfg.profile} buy={cfg.buy_eth}ETH mc=[{cfg.min_mc:.0f},{cfg.max_mc:.0f}] "
-        f"fresh<={cfg.fresh_max_age_sec}s reheat_vol>={cfg.reheat_min_vol_1h} min_liq={cfg.min_liquidity} live={cfg.live}",
-        flush=True,
-    )
-    print(
-        f"[pace] poll={cfg.poll_sec}s gate_every={cfg.gate_every} max_gates={cfg.max_gates_per_tick} "
-        f"mon_sec_every={cfg.mon_security_every} ~weight/s≈{est / cfg.poll_sec:.1f} (cap 20)",
-        flush=True,
-    )
-    print(
-        f"[exits] TP {cfg.tp1}/{cfg.tp1_pct}+{cfg.tp2}/{cfg.tp2_pct}+{cfg.tp3}/{cfg.tp3_pct} SL -{cfg.sl}% "
-        f"max_hold={cfg.max_hold_sec}s lp_drop={cfg.lp_drop_pct}%",
-        flush=True,
-    )
+    print(f"[start] profile={cfg.profile} buy={cfg.buy_eth}ETH mc=[{cfg.min_mc:.0f},{cfg.max_mc:.0f}] fresh<={cfg.fresh_max_age_sec}s reheat_vol>={cfg.reheat_min_vol_1h} min_liq={cfg.min_liquidity} live={cfg.live}", flush=True)
+    print(f"[pace] poll={cfg.poll_sec}s gate_every={cfg.gate_every} max_gates={cfg.max_gates_per_tick} mon_sec_every={cfg.mon_security_every} ~weight/s≈{est / cfg.poll_sec:.1f} (cap 20)", flush=True)
+    print(f"[exits] TP {cfg.tp1}/{cfg.tp1_pct}+{cfg.tp2}/{cfg.tp2_pct}+{cfg.tp3}/{cfg.tp3_pct} SL -{cfg.sl}% max_hold={cfg.max_hold_sec}s lp_drop={cfg.lp_drop_pct}%", flush=True)
     while True:
         t0 = time.time()
         tick += 1
         rollover_day(st)
         prune_seen(st)
-
-        # 1) FAST mon: liq every loop; security every mon_security_every
         do_sec = (tick % max(cfg.mon_security_every, 1) == 0) or cfg.once
         try:
             monitor_positions(cfg, st, with_security=do_sec)
@@ -557,21 +593,13 @@ def loop(cfg: Config) -> None:
             time.sleep(max(0.0, cfg.poll_sec - (time.time() - t0)))
             continue
 
-        # 2) FAST scan every loop (trenches weight=3)
-        cands: list[dict] = []
         if open_n < cfg.max_positions:
             try:
                 cands = fetch_candidates(cfg)
             except Exception as e:
                 print(f"[err] trenches: {e}", flush=True)
                 cands = []
-            print(
-                f"[scan] tick={tick} cands={len(cands)} open={open_n} buys_today={st.get('buys_today', 0)} "
-                f"gate={'Y' if tick % max(cfg.gate_every, 1) == 0 or cfg.once else 'N'}",
-                flush=True,
-            )
-
-            # 3) SLOW gate: hard-check only every gate_every ticks, max K candidates
+            print(f"[scan] tick={tick} cands={len(cands)} open={open_n} buys_today={st.get('buys_today', 0)} gate={'Y' if tick % max(cfg.gate_every, 1) == 0 or cfg.once else 'N'}", flush=True)
             if cands and (tick % max(cfg.gate_every, 1) == 0 or cfg.once):
                 checked = 0
                 try:
@@ -586,59 +614,38 @@ def loop(cfg: Config) -> None:
                         ok, reason, snap = pre_entry_gate(cfg, t)
                         st["seen"][addr] = int(time.time())
                         if not ok:
-                            log_event(
-                                {
-                                    "event": "reject",
-                                    "token": addr,
-                                    "symbol": sym,
-                                    "reason": reason,
-                                    "mc": snap.get("mc"),
-                                    "liq": snap.get("liquidity"),
-                                    "age": snap.get("age"),
-                                    "lp": snap.get("launchpad") or t.get("_lp"),
-                                }
-                            )
-                            print(
-                                f"[reject] {sym} {reason} mc={snap.get('mc', 0):.0f} liq={snap.get('liquidity', 0):.0f}",
-                                flush=True,
-                            )
+                            log_event({"event": "reject", "token": addr, "symbol": sym, "reason": reason, "mc": snap.get("mc"), "liq": snap.get("liquidity"), "age": snap.get("age"), "lp": snap.get("launchpad") or t.get("_lp")})
+                            print(f"[reject] {sym} {reason} mc={snap.get('mc', 0):.0f} liq={snap.get('liquidity', 0):.0f}", flush=True)
                             continue
-                        print(
-                            f"[signal] {sym} mode={snap.get('entry_mode')} mc=${snap.get('mc', 0):.0f} "
-                            f"liq={snap.get('liquidity', 0):.0f} age={snap.get('age')} {snap.get('entry_why')} {addr[:12]}…",
-                            flush=True,
-                        )
+                        print(f"[signal] {sym} mode={snap.get('entry_mode')} mc=${snap.get('mc', 0):.0f} liq={snap.get('liquidity', 0):.0f} buy={snap.get('buy_eth', cfg.buy_eth)} age={snap.get('age')} {snap.get('entry_why')} {addr[:12]}…", flush=True)
                         try:
-                            res = buy(cfg, t["address"], sym)
+                            if cfg.probe_eth > 0:
+                                pok, preason, pmeta = probe_trade(cfg, t["address"], sym)
+                                log_event({"event": "probe", "ok": pok, "reason": preason, "symbol": sym, "token": addr, "probe_eth": pmeta.get("probe_eth"), "mode": pmeta.get("mode")})
+                                if not pok:
+                                    print(f"[probe_fail] {sym} {preason}", flush=True)
+                                    continue
+                                print(f"[probe_ok] {sym} {preason}", flush=True)
+                            res = buy(cfg, t["address"], sym, buy_eth=snap.get("buy_eth"))
                             entry_liq = snap.get("liquidity") or fnum(t.get("liquidity"))
-                            log_event(
-                                {
-                                    "event": "buy",
-                                    **res,
-                                    "entry_liq": entry_liq,
-                                    "mc": snap.get("mc"),
-                                    "mode": snap.get("entry_mode"),
-                                    "why": snap.get("entry_why"),
-                                    "lp": snap.get("launchpad") or t.get("_lp"),
-                                }
-                            )
+                            log_event({"event": "buy", **res, "entry_liq": entry_liq, "mc": snap.get("mc"), "mode": snap.get("entry_mode"), "why": snap.get("entry_why"), "lp": snap.get("launchpad") or t.get("_lp")})
                             if cfg.live or cfg.paper_positions:
                                 st.setdefault("positions", {})[addr] = {
                                     "symbol": sym,
                                     "ts": int(time.time()),
-                                    "buy_eth": cfg.buy_eth,
+                                    "buy_eth": snap.get("buy_eth") or cfg.buy_eth,
                                     "entry_liq": entry_liq,
                                     "entry_mc": snap.get("mc"),
                                     "entry_mode": snap.get("entry_mode"),
                                     "lp": snap.get("launchpad") or t.get("_lp"),
                                     "mode": res.get("mode"),
+                                    "creator_address": snap.get("creator_address"),
+                                    "creator_token_balance": snap.get("creator_token_balance"),
+                                    "creator_token_status": snap.get("creator_token_status"),
                                 }
                             st["buys_today"] = int(st.get("buys_today") or 0) + 1
-                            print(
-                                f"[buy] {res.get('mode')} {sym} mc=${snap.get('mc', 0):.0f} liq={entry_liq:.0f}",
-                                flush=True,
-                            )
-                            break  # one entry per gate tick
+                            print(f"[buy] {res.get('mode')} {sym} mc=${snap.get('mc', 0):.0f} liq={entry_liq:.0f}", flush=True)
+                            break
                         except Exception as e:
                             log_event({"event": "buy_error", "token": addr, "symbol": sym, "error": str(e)[:300]})
                             print(f"[buy_err] {sym}: {e}", flush=True)
@@ -648,7 +655,6 @@ def loop(cfg: Config) -> None:
 
         if cfg.once:
             break
-        # keep loop cadence even if API was slow
         time.sleep(max(0.0, cfg.poll_sec - (time.time() - t0)))
 
 
@@ -719,8 +725,16 @@ def build_config(
     allow_uniswap: bool = False,
     live: bool = False,
     once: bool = False,
+    require_sell_quote: bool = True,
+    probe_eth: float = 0.0,
+    risk_pct: float = 0.0,
+    max_buy_eth: float = 0.0,
+    min_wallet_eth: float = 0.01,
+    anti_mev: bool = True,
+    max_creator_open_count: int = 20,
+    reject_creator_hold: bool = False,
+    enable_fake_heat: bool = True,
 ) -> Config:
-    """Assemble Config from CLI/options. Profile first, then explicit overrides."""
     cfg = Config(
         wallet=wallet or os.environ.get("GMGN_WALLET", "0x37e9f4a84693bce7f7729612ee91a94c91eef898"),
         buy_eth=buy_eth,
@@ -736,6 +750,15 @@ def build_config(
         only_safe_lp=not allow_uniswap,
         live=live,
         once=once,
+        require_sell_quote=require_sell_quote,
+        probe_eth=probe_eth,
+        risk_pct=risk_pct,
+        max_buy_eth=max_buy_eth,
+        min_wallet_eth=min_wallet_eth,
+        anti_mev=anti_mev,
+        max_creator_open_count=max_creator_open_count,
+        reject_creator_hold=reject_creator_hold,
+        enable_fake_heat=enable_fake_heat,
     )
     apply_profile(cfg, profile, buy_eth)
     if min_mc is not None:
@@ -756,7 +779,63 @@ def build_config(
 def run_bot(cfg: Config) -> None:
     if cfg.live:
         print("WARNING: --live spends real funds", flush=True)
+        ok, reason = live_preflight(cfg)
+        if not ok:
+            print(f"[live_blocked] {reason}", flush=True)
+            log_event({"event": "live_blocked", "reason": reason})
+            return
+        print(f"[live_preflight] {reason}", flush=True)
+    size = resolve_buy_eth(cfg)
+    print(
+        f"[size] buy_eth={size:.6f} risk_pct={cfg.risk_pct} probe_eth={cfg.probe_eth} "
+        f"sell_quote={cfg.require_sell_quote} anti_mev={cfg.anti_mev}",
+        flush=True,
+    )
     try:
         loop(cfg)
     except KeyboardInterrupt:
         print("\n[stop]", flush=True)
+
+
+def compute_stats(log_path: Path | None = None) -> dict:
+    path = log_path or LOG_PATH
+    if not path.exists():
+        return {"events": 0}
+    counts: dict[str, int] = {}
+    rejects: dict[str, int] = {}
+    buys = probes_ok = probes_fail = rug_exits = 0
+    for line in path.read_text().splitlines():
+        try:
+            o = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        ev = o.get("event") or ("buy" if o.get("mode") and "buy_eth" in o else "unknown")
+        # normalize
+        if "event" not in o and o.get("mode") in ("dry-run", "live") and "buy_eth" in o:
+            ev = "buy"
+        if o.get("event") == "emergency_sell":
+            ev = "emergency_sell"
+        counts[ev] = counts.get(ev, 0) + 1
+        if ev == "reject":
+            r = str(o.get("reason") or "?")
+            key = r.split(":")[0].split(" ")[0]
+            rejects[key] = rejects.get(key, 0) + 1
+        elif ev == "buy":
+            buys += 1
+        elif ev == "probe":
+            if o.get("ok"):
+                probes_ok += 1
+            else:
+                probes_fail += 1
+        elif ev == "emergency_sell":
+            rug_exits += 1
+    return {
+        "events": sum(counts.values()),
+        "counts": counts,
+        "buys": buys,
+        "probes_ok": probes_ok,
+        "probes_fail": probes_fail,
+        "emergency_sells": rug_exits,
+        "reject_reasons": dict(sorted(rejects.items(), key=lambda x: -x[1])[:15]),
+        "log": str(path),
+    }

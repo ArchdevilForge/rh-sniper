@@ -6,15 +6,16 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
-from pathlib import Path
 from typing import Optional
 
 import typer
 
+from rh_sniper import __version__
 from rh_sniper.engine import (
     LOG_PATH,
     STATE_PATH,
     build_config,
+    compute_stats,
     load_state,
     run_bot,
 )
@@ -53,6 +54,15 @@ def run(
     allow_uniswap: bool = typer.Option(False, "--allow-uniswap", help="Allow naked Uni pools"),
     live: bool = typer.Option(False, "--live", help="REAL money (off by default)"),
     once: bool = typer.Option(False, "--once", help="Single cycle then exit"),
+    require_sell_quote: bool = typer.Option(True, "--require-sell-quote/--no-sell-quote", help="Require token->NATIVE quote"),
+    probe_eth: float = typer.Option(0.0, "--probe-eth", help="Probe size; >0 enables probe buy/sell before full size"),
+    risk_pct: float = typer.Option(0.0, "--risk-pct", help="Size as % of native (2=2%); 0=use --buy-eth"),
+    max_buy_eth: float = typer.Option(0.0, "--max-buy-eth", help="Cap when using --risk-pct"),
+    min_wallet_eth: float = typer.Option(0.01, "--min-wallet-eth", help="Live gate min native balance"),
+    anti_mev: bool = typer.Option(True, "--anti-mev/--no-anti-mev"),
+    max_creator_open_count: int = typer.Option(20, "--max-creator-open-count", help="0 disables"),
+    reject_creator_hold: bool = typer.Option(False, "--reject-creator-hold"),
+    enable_fake_heat: bool = typer.Option(True, "--fake-heat/--no-fake-heat"),
 ) -> None:
     """Start the sniper (dry-run unless --live)."""
     if profile not in {"adff", "7a23", "417c"}:
@@ -79,6 +89,15 @@ def run(
         allow_uniswap=allow_uniswap,
         live=live,
         once=once,
+        require_sell_quote=require_sell_quote,
+        probe_eth=probe_eth,
+        risk_pct=risk_pct,
+        max_buy_eth=max_buy_eth,
+        min_wallet_eth=min_wallet_eth,
+        anti_mev=anti_mev,
+        max_creator_open_count=max_creator_open_count,
+        reject_creator_hold=reject_creator_hold,
+        enable_fake_heat=enable_fake_heat,
     )
     run_bot(cfg)
 
@@ -93,32 +112,37 @@ def status_cmd() -> None:
     pos = st.get("positions") or {}
     seen = st.get("seen") or {}
     typer.echo(f"state: {STATE_PATH}")
-    typer.echo(f"day: {st.get('day')}  buys_today: {st.get('buys_today', 0)}  day_pnl_est: {st.get('day_realized_est', 0)}")
+    typer.echo(
+        f"day: {st.get('day')}  buys_today: {st.get('buys_today', 0)}  day_pnl_est: {st.get('day_realized_est', 0)}"
+    )
     typer.echo(f"seen_tokens: {len(seen)}  open_positions: {len(pos)}")
     for addr, meta in pos.items():
         typer.echo(
             f"  - {meta.get('symbol', '?')} {addr[:12]}… "
             f"mode={meta.get('entry_mode')} mc={meta.get('entry_mc')} "
-            f"liq={meta.get('entry_liq')} {meta.get('mode')}"
+            f"liq={meta.get('entry_liq')} buy={meta.get('buy_eth')} {meta.get('mode')}"
         )
 
 
 @app.command()
 def logs(
     n: int = typer.Option(20, "--n", "-n", help="Show last N events"),
-    event: Optional[str] = typer.Option(None, "--event", "-e", help="Filter event type (buy/reject/...)"),
+    event: Optional[str] = typer.Option(None, "--event", "-e", help="Filter event type"),
 ) -> None:
     """Tail trades.jsonl."""
     if not LOG_PATH.exists():
         typer.echo(f"no log file: {LOG_PATH}")
         raise typer.Exit(1)
-    lines = LOG_PATH.read_text().splitlines()
     rows = []
-    for line in lines:
+    for line in LOG_PATH.read_text().splitlines():
         try:
             obj = json.loads(line)
         except json.JSONDecodeError:
             continue
+        ev = obj.get("event")
+        if not ev and obj.get("mode") in ("dry-run", "live") and "buy_eth" in obj:
+            ev = "buy"
+            obj = {**obj, "event": "buy"}
         if event and obj.get("event") != event:
             continue
         rows.append(obj)
@@ -129,7 +153,23 @@ def logs(
         reason = obj.get("reason") or obj.get("mode") or ""
         mc = obj.get("mc")
         extra = f" mc={mc}" if mc is not None else ""
-        typer.echo(f"{ts} {ev:16} {sym:12} {reason}{extra}")
+        typer.echo(f"{ts} {str(ev):16} {sym:12} {reason}{extra}")
+
+
+@app.command()
+def stats() -> None:
+    """Summarize trades.jsonl (rejects / buys / probes / emergency exits)."""
+    s = compute_stats()
+    if not s.get("events"):
+        typer.echo(f"no events in {s.get('log', LOG_PATH)}")
+        raise typer.Exit(1)
+    typer.echo(f"log: {s['log']}")
+    typer.echo(f"events: {s['events']}  buys: {s['buys']}  emergency_sells: {s['emergency_sells']}")
+    typer.echo(f"probes_ok: {s['probes_ok']}  probes_fail: {s['probes_fail']}")
+    typer.echo(f"counts: {s.get('counts')}")
+    typer.echo("top reject reasons:")
+    for k, v in (s.get("reject_reasons") or {}).items():
+        typer.echo(f"  {k}: {v}")
 
 
 @app.command()
@@ -157,7 +197,19 @@ def doctor() -> None:
                 for w in wallets:
                     if w.get("chain") == "robinhood":
                         bals = w.get("balances") or []
-                        typer.echo(f"      robinhood {w.get('address')} balances={len(bals)}")
+                        native = 0.0
+                        for b in bals:
+                            if (b.get("token_address") or "").lower() in (
+                                "",
+                                "0x0000000000000000000000000000000000000000",
+                            ):
+                                try:
+                                    native = float(b.get("balance") or 0)
+                                except Exception:
+                                    native = 0.0
+                        typer.echo(f"      robinhood {w.get('address')} native≈{native}")
+                        if native <= 0:
+                            typer.echo("WARN  robinhood native balance is 0 — --live will be blocked")
             except json.JSONDecodeError:
                 typer.echo("WARN  portfolio info not JSON")
         else:
@@ -185,7 +237,6 @@ def reset_state(
 @app.command()
 def version() -> None:
     """Print version."""
-    from rh_sniper import __version__
     typer.echo(f"rh-sniper {__version__}")
 
 
