@@ -72,6 +72,18 @@ def run(
     max_open_exposure_pct: float = typer.Option(15.0, "--max-open-exposure-pct"),
     use_default_risk: bool = typer.Option(False, "--use-default-risk", help="Use profile default risk% if --risk-pct not set"),
     tp_ladder: Optional[str] = typer.Option(None, "--tp-ladder", help="e.g. 100:55,200:25,400:10"),
+    active_hours_cn: str = typer.Option(
+        "18-4",
+        "--active-hours-cn",
+        help="CN hours window, e.g. 18-4 or 18-21,8-12; all/24h = always",
+    ),
+    offhours_mode: str = typer.Option(
+        "sleep",
+        "--offhours-mode",
+        help="sleep=rest no entries; mon=legacy alias of sleep; off=deep idle",
+    ),
+    offhours_poll_sec: float = typer.Option(60.0, "--offhours-poll", help="Seconds between checks when resting"),
+    timezone_offset_hours: int = typer.Option(8, "--tz-offset", help="Local offset hours (CN=8)"),
 ) -> None:
     """Start the sniper (dry-run unless --live)."""
     if profile not in {"adff", "7a23", "417c"}:
@@ -117,6 +129,10 @@ def run(
         bankroll_eth=bankroll_eth,
         max_open_exposure_pct=max_open_exposure_pct,
         use_default_risk=use_default_risk if use_default_risk else None,
+        active_hours_cn=active_hours_cn,
+        offhours_mode=offhours_mode,
+        offhours_poll_sec=offhours_poll_sec,
+        timezone_offset_hours=timezone_offset_hours,
     )
     if tp_ladder:
         parts = []

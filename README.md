@@ -89,8 +89,11 @@ CLI entrypoint: **`rh-sniper`** (Typer). Compat: `python rh_sniper.py`.
 # single dry-run cycle (no funds moved)
 rh-sniper run --once -p adff
 
+# recommended: main session only CN 18:00–04:00, rest otherwise
+rh-sniper run -p adff --active-hours-cn 18-4
+
 # recommended dry-run with probe quotes + sell-side check
-rh-sniper run -p adff --probe-eth 0.001
+rh-sniper run -p 7a23 --active-hours-cn 18-4 --probe-eth 0.001
 
 # live (real money) — start tiny; blocked if RH balance too low
 rh-sniper run --live -p adff \

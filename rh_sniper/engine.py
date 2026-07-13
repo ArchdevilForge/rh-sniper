@@ -8,6 +8,7 @@ import os
 import subprocess
 import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 NATIVE = "0x0000000000000000000000000000000000000000"
@@ -97,6 +98,11 @@ class Config:
     max_open_exposure_pct: float = 15.0  # sum open buy_eth / bankroll
     default_risk_pct: float = 1.0   # if risk_pct==0 and use_default_risk
     use_default_risk: bool = False
+    # Session window (China time UTC+8). Only hunt in-window; off-hours rest or slow mon.
+    active_hours_cn: str = "18-4"  # main session 18:00–04:00 CN; empty = 24h
+    offhours_mode: str = "sleep"  # sleep | mon | off
+    offhours_poll_sec: float = 60.0  # only used if offhours_mode=mon
+    timezone_offset_hours: int = 8  # CN default
 
 
 def load_state() -> dict:
@@ -646,6 +652,63 @@ def rollover_day(st: dict) -> None:
         st["buys_today"] = 0
 
 
+
+def parse_active_hours_cn(spec: str) -> list[tuple[int, int]] | None:
+    """Parse '18-4' or '18-21,8-12' into [(start,end),...] end exclusive in hour grid with wrap.
+    Empty/none/all/24h => None (always active).
+    """
+    if not spec:
+        return None
+    s = spec.strip().lower()
+    if s in ("", "all", "24h", "24", "*"):
+        return None
+    windows: list[tuple[int, int]] = []
+    for part in s.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" not in part:
+            raise ValueError(f"bad active hours segment: {part}")
+        a, b = part.split("-", 1)
+        start, end = int(a), int(b)
+        if not (0 <= start <= 23 and 0 <= end <= 23):
+            raise ValueError(f"hours must be 0-23: {part}")
+        windows.append((start, end))
+    return windows or None
+
+
+def hour_in_windows(hour: int, windows: list[tuple[int, int]] | None) -> bool:
+    if not windows:
+        return True
+    for start, end in windows:
+        if start == end:
+            return True  # 24h degenerate
+        if start < end:
+            if start <= hour < end:
+                return True
+        else:
+            # wrap: e.g. 18-4 means 18..23 and 0..3
+            if hour >= start or hour < end:
+                return True
+    return False
+
+
+def is_active_session(cfg: Config, now: datetime | None = None) -> tuple[bool, int, str]:
+    """Return (active, local_hour, label)."""
+    tz = timezone(timedelta(hours=int(cfg.timezone_offset_hours)))
+    now = now or datetime.now(tz=timezone.utc)
+    local = now.astimezone(tz)
+    hour = local.hour
+    try:
+        windows = parse_active_hours_cn(cfg.active_hours_cn)
+    except Exception as e:
+        return True, hour, f"bad_hours:{e}"
+    active = hour_in_windows(hour, windows)
+    label = f"CN{hour:02d} {'ACTIVE' if active else 'REST'} window={cfg.active_hours_cn or '24h'}"
+    return active, hour, label
+
+
+
 def loop(cfg: Config) -> None:
     st = load_state()
     tick = 0
@@ -658,12 +721,20 @@ def loop(cfg: Config) -> None:
         f"max_hold={cfg.max_hold_sec}s lp_drop={cfg.lp_drop_pct}%",
         flush=True,
     )
+    print(
+        f"[session] active_hours_cn={cfg.active_hours_cn or '24h'} offhours={cfg.offhours_mode} "
+        f"tz=UTC+{cfg.timezone_offset_hours}",
+        flush=True,
+    )
     while True:
         t0 = time.time()
         tick += 1
         rollover_day(st)
         prune_seen(st)
-        do_sec = (tick % max(cfg.mon_security_every, 1) == 0) or cfg.once
+
+        active, local_hour, sess_label = is_active_session(cfg)
+        # Always monitor open positions (even off-hours) so exits still work
+        do_sec = (tick % max(cfg.mon_security_every, 1) == 0) or cfg.once or (not active and bool(st.get("positions")))
         try:
             monitor_positions(cfg, st, with_security=do_sec)
         except Exception as e:
@@ -676,6 +747,28 @@ def loop(cfg: Config) -> None:
             if cfg.once:
                 break
             time.sleep(max(0.0, cfg.poll_sec - (time.time() - t0)))
+            continue
+
+        # Off-hours: rest (no new entries). Optionally slow mon-only mode.
+        if not active and not cfg.once:
+            if open_n:
+                # keep monitoring with short-ish sleep so SL/LP exits remain timely
+                sleep_s = min(cfg.poll_sec * 2, 15.0)
+                if tick % 10 == 1:
+                    print(f"[rest] {sess_label} open={open_n} mon-only sleep={sleep_s}s", flush=True)
+                time.sleep(max(0.0, sleep_s - (time.time() - t0)))
+                continue
+            mode = (cfg.offhours_mode or "sleep").lower()
+            if mode == "off":
+                if tick % 5 == 1:
+                    print(f"[rest] {sess_label} bot idle (off)", flush=True)
+                time.sleep(max(30.0, cfg.offhours_poll_sec) - (time.time() - t0) if False else max(30.0, float(cfg.offhours_poll_sec)))
+                continue
+            # sleep: long idle until next check
+            sleep_s = max(30.0, float(cfg.offhours_poll_sec))
+            if tick % 3 == 1:
+                print(f"[rest] {sess_label} no new entries, sleep={sleep_s:.0f}s", flush=True)
+            time.sleep(max(0.0, sleep_s - (time.time() - t0)))
             continue
 
         if open_n < cfg.max_positions:
@@ -858,6 +951,10 @@ def build_config(
     bankroll_eth: float = 0.0,
     max_open_exposure_pct: float = 15.0,
     use_default_risk: bool | None = None,
+    active_hours_cn: str = "18-4",
+    offhours_mode: str = "sleep",
+    offhours_poll_sec: float = 60.0,
+    timezone_offset_hours: int = 8,
 ) -> Config:
     cfg = Config(
         wallet=wallet or os.environ.get("GMGN_WALLET", "0x37e9f4a84693bce7f7729612ee91a94c91eef898"),
@@ -886,6 +983,10 @@ def build_config(
         use_trailing=use_trailing,
         bankroll_eth=bankroll_eth,
         max_open_exposure_pct=max_open_exposure_pct,
+        active_hours_cn=active_hours_cn,
+        offhours_mode=offhours_mode,
+        offhours_poll_sec=offhours_poll_sec,
+        timezone_offset_hours=timezone_offset_hours,
     )
     apply_profile(cfg, profile, buy_eth)
     if exit_mode:
@@ -914,6 +1015,11 @@ def build_config(
 
 
 def run_bot(cfg: Config) -> None:
+    try:
+        parse_active_hours_cn(cfg.active_hours_cn)
+    except Exception as e:
+        print(f"[config_error] active_hours_cn: {e}", flush=True)
+        return
     if cfg.live:
         print("WARNING: --live spends real funds", flush=True)
         ok, reason = live_preflight(cfg)

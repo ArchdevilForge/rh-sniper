@@ -1,6 +1,6 @@
 [project]
 name = "rh-sniper"
-version = "0.3.1"
+version = "0.3.2"
 description = "Robinhood-chain meme sniper via GMGN OpenAPI (strategy replica, not copy-trade)"
 readme = "README.md"
 requires-python = ">=3.10"
