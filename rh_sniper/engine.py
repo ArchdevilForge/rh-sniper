@@ -61,13 +61,20 @@ class Config:
     max_hold_sec: int = 300
     require_can_sell: bool = True
     only_safe_lp: bool = True
-    tp1: float = 15
-    tp1_pct: float = 50
-    tp2: float = 40
-    tp2_pct: float = 30
-    tp3: float = 100
-    tp3_pct: float = 20
-    sl: float = 20
+    # Exit plan: principal-out first, then pyramid scale-out + trailing
+    exit_mode: str = "principal"  # principal | sniper | wide
+    tp1: float = 100          # +100% = 2x
+    tp1_pct: float = 55       # sell ~55% (principal + small profit)
+    tp2: float = 200
+    tp2_pct: float = 25
+    tp3: float = 400
+    tp3_pct: float = 10
+    # remainder ~10% trailing
+    trail_activate_pct: float = 100
+    trail_drawdown_pct: float = 20
+    hard_sl_pct: float = 35   # fixed hard stop (was sl)
+    sl: float = 35            # alias used in logs / legacy
+    use_trailing: bool = True
     live: bool = False
     once: bool = False
     paper_positions: bool = True
@@ -85,6 +92,11 @@ class Config:
     fake_heat_min_vol_1h: float = 20000.0
     fake_heat_max_price_change_1h: float = 0.05
     enable_fake_heat: bool = True
+    # Position management
+    bankroll_eth: float = 0.0       # 0 => native balance
+    max_open_exposure_pct: float = 15.0  # sum open buy_eth / bankroll
+    default_risk_pct: float = 1.0   # if risk_pct==0 and use_default_risk
+    use_default_risk: bool = False
 
 
 def load_state() -> dict:
@@ -103,12 +115,38 @@ def log_event(obj: dict) -> None:
 
 
 def condition_orders(cfg: Config) -> str:
+    """Build TP/SL ladder.
+
+    principal mode (default, matched to reversed wallets + user theory):
+      - first scale-out near 2x sells majority of bag (principal + small profit)
+      - further pyramid TPs
+      - hard SL
+      - trailing on remaining after trail_activate
+
+    Note: GMGN condition-orders cannot truly "move SL to breakeven after TP1"
+    as a dependency graph; we approximate with fixed ladder + trailing remainder.
+    """
+    sl = int(cfg.hard_sl_pct or cfg.sl or 35)
     orders = [
         {"order_type": "profit_stop", "side": "sell", "price_scale": str(int(cfg.tp1)), "sell_ratio": str(int(cfg.tp1_pct))},
         {"order_type": "profit_stop", "side": "sell", "price_scale": str(int(cfg.tp2)), "sell_ratio": str(int(cfg.tp2_pct))},
         {"order_type": "profit_stop", "side": "sell", "price_scale": str(int(cfg.tp3)), "sell_ratio": str(int(cfg.tp3_pct))},
-        {"order_type": "loss_stop", "side": "sell", "price_scale": str(int(cfg.sl)), "sell_ratio": "100"},
+        {"order_type": "loss_stop", "side": "sell", "price_scale": str(sl), "sell_ratio": "100"},
     ]
+    # remainder after tp1+tp2+tp3
+    sold = int(cfg.tp1_pct) + int(cfg.tp2_pct) + int(cfg.tp3_pct)
+    rem = max(0, 100 - sold)
+    if cfg.use_trailing and rem > 0:
+        orders.append({
+            "order_type": "profit_stop_trace",
+            "side": "sell",
+            "price_scale": str(int(cfg.trail_activate_pct)),
+            "sell_ratio": str(rem),
+            "drawdown_rate": str(int(cfg.trail_drawdown_pct)),
+        })
+    elif rem > 0:
+        # dump remainder at tp3 if no trail
+        orders[2]["sell_ratio"] = str(int(cfg.tp3_pct) + rem)
     return json.dumps(orders, separators=(",", ":"))
 
 
@@ -147,16 +185,40 @@ def native_balance_eth(cfg: Config) -> float:
     return 0.0
 
 
+def bankroll_eth(cfg: Config) -> float:
+    if cfg.bankroll_eth and cfg.bankroll_eth > 0:
+        return cfg.bankroll_eth
+    return native_balance_eth(cfg)
+
+
 def resolve_buy_eth(cfg: Config) -> float:
-    if cfg.risk_pct and cfg.risk_pct > 0:
-        bal = native_balance_eth(cfg)
-        pct = cfg.risk_pct / 100.0 if cfg.risk_pct >= 1 else cfg.risk_pct
+    """Fixed buy_eth, or risk_pct of bankroll (native or --bankroll-eth)."""
+    risk = cfg.risk_pct
+    if (not risk or risk <= 0) and cfg.use_default_risk and cfg.default_risk_pct > 0:
+        risk = cfg.default_risk_pct
+    if risk and risk > 0:
+        bal = bankroll_eth(cfg)
+        pct = risk / 100.0 if risk >= 1 else risk
         size = bal * pct
-        cap = cfg.max_buy_eth if cfg.max_buy_eth > 0 else cfg.buy_eth
+        cap = cfg.max_buy_eth if cfg.max_buy_eth > 0 else (cfg.buy_eth if cfg.buy_eth > 0 else size)
         if cap > 0:
             size = min(size, cap)
         return max(size, 0.0)
     return max(cfg.buy_eth, 0.0)
+
+
+def exposure_ok(cfg: Config, st: dict, next_buy_eth: float) -> tuple[bool, str]:
+    """Cap aggregate open exposure vs bankroll."""
+    if cfg.max_open_exposure_pct <= 0:
+        return True, "ok"
+    br = bankroll_eth(cfg)
+    if br <= 0:
+        return True, "no_bankroll_skip_exposure"
+    open_eth = sum(float(m.get("buy_eth") or 0) for m in (st.get("positions") or {}).values())
+    pct = (open_eth + next_buy_eth) / br * 100.0
+    if pct > cfg.max_open_exposure_pct:
+        return False, f"exposure {pct:.1f}%>{cfg.max_open_exposure_pct}"
+    return True, f"exposure {pct:.1f}%"
 
 
 def live_preflight(cfg: Config) -> tuple[bool, str]:
@@ -572,7 +634,12 @@ def loop(cfg: Config) -> None:
     est = 3 + cfg.max_positions + (4 * cfg.max_gates_per_tick) / max(cfg.gate_every, 1)
     print(f"[start] profile={cfg.profile} buy={cfg.buy_eth}ETH mc=[{cfg.min_mc:.0f},{cfg.max_mc:.0f}] fresh<={cfg.fresh_max_age_sec}s reheat_vol>={cfg.reheat_min_vol_1h} min_liq={cfg.min_liquidity} live={cfg.live}", flush=True)
     print(f"[pace] poll={cfg.poll_sec}s gate_every={cfg.gate_every} max_gates={cfg.max_gates_per_tick} mon_sec_every={cfg.mon_security_every} ~weight/s≈{est / cfg.poll_sec:.1f} (cap 20)", flush=True)
-    print(f"[exits] TP {cfg.tp1}/{cfg.tp1_pct}+{cfg.tp2}/{cfg.tp2_pct}+{cfg.tp3}/{cfg.tp3_pct} SL -{cfg.sl}% max_hold={cfg.max_hold_sec}s lp_drop={cfg.lp_drop_pct}%", flush=True)
+    print(
+        f"[exits] mode={cfg.exit_mode} TP {cfg.tp1}/{cfg.tp1_pct}+{cfg.tp2}/{cfg.tp2_pct}+{cfg.tp3}/{cfg.tp3_pct} "
+        f"trail@{cfg.trail_activate_pct}% dd{cfg.trail_drawdown_pct}% SL -{cfg.hard_sl_pct}% "
+        f"max_hold={cfg.max_hold_sec}s lp_drop={cfg.lp_drop_pct}%",
+        flush=True,
+    )
     while True:
         t0 = time.time()
         tick += 1
@@ -626,7 +693,13 @@ def loop(cfg: Config) -> None:
                                     print(f"[probe_fail] {sym} {preason}", flush=True)
                                     continue
                                 print(f"[probe_ok] {sym} {preason}", flush=True)
-                            res = buy(cfg, t["address"], sym, buy_eth=snap.get("buy_eth"))
+                            next_size = float(snap.get("buy_eth") or resolve_buy_eth(cfg))
+                            ok_exp, exp_reason = exposure_ok(cfg, st, next_size)
+                            if not ok_exp:
+                                log_event({"event": "reject", "token": addr, "symbol": sym, "reason": exp_reason})
+                                print(f"[reject] {sym} {exp_reason}", flush=True)
+                                continue
+                            res = buy(cfg, t["address"], sym, buy_eth=next_size)
                             entry_liq = snap.get("liquidity") or fnum(t.get("liquidity"))
                             log_event({"event": "buy", **res, "entry_liq": entry_liq, "mc": snap.get("mc"), "mode": snap.get("entry_mode"), "why": snap.get("entry_why"), "lp": snap.get("launchpad") or t.get("_lp")})
                             if cfg.live or cfg.paper_positions:
@@ -669,11 +742,17 @@ def apply_profile(cfg: Config, name: str, buy_eth_cli: float) -> None:
         cfg.reheat_min_vol_1h = 5000
         cfg.reheat_min_swaps_1h = 20
         cfg.min_liquidity = 1200
-        cfg.tp1, cfg.tp1_pct = 15, 50
-        cfg.tp2, cfg.tp2_pct = 40, 30
-        cfg.tp3, cfg.tp3_pct = 100, 20
-        cfg.sl = 20
+        # principal-out even on micro-cap: first major take at ~2x
+        cfg.exit_mode = "principal"
+        cfg.tp1, cfg.tp1_pct = 100, 55  # 2x sell 55% = principal + small profit
+        cfg.tp2, cfg.tp2_pct = 200, 25
+        cfg.tp3, cfg.tp3_pct = 400, 10
+        cfg.trail_activate_pct = 100
+        cfg.trail_drawdown_pct = 25
+        cfg.hard_sl_pct = cfg.sl = 30
         cfg.max_hold_sec = 180
+        cfg.use_default_risk = True
+        cfg.default_risk_pct = 1.0
     elif name == "7a23":
         # 0xDavid: probe-ish mid size, $5-40k MC
         cfg.buy_eth = 0.06 if buy_eth_cli == 0.03 else buy_eth_cli
@@ -682,11 +761,17 @@ def apply_profile(cfg: Config, name: str, buy_eth_cli: float) -> None:
         cfg.reheat_min_vol_1h = 8000
         cfg.reheat_min_swaps_1h = 30
         cfg.min_liquidity = 2000
-        cfg.tp1, cfg.tp1_pct = 20, 40
-        cfg.tp2, cfg.tp2_pct = 60, 30
-        cfg.tp3, cfg.tp3_pct = 150, 30
-        cfg.sl = 25
+        # principal-out classic: first major take near 2x
+        cfg.exit_mode = "principal"
+        cfg.tp1, cfg.tp1_pct = 100, 55  # 2x sell 55% ~ principal + small profit
+        cfg.tp2, cfg.tp2_pct = 200, 25
+        cfg.tp3, cfg.tp3_pct = 400, 10
+        cfg.trail_activate_pct = 100
+        cfg.trail_drawdown_pct = 20
+        cfg.hard_sl_pct = cfg.sl = 35
         cfg.max_hold_sec = 300
+        cfg.use_default_risk = True
+        cfg.default_risk_pct = 1.0
     elif name == "417c":
         # heavier size, wider MC incl secondary heat
         cfg.buy_eth = 0.12 if buy_eth_cli == 0.03 else buy_eth_cli
@@ -695,11 +780,17 @@ def apply_profile(cfg: Config, name: str, buy_eth_cli: float) -> None:
         cfg.reheat_min_vol_1h = 12000
         cfg.reheat_min_swaps_1h = 40
         cfg.min_liquidity = 3000
-        cfg.tp1, cfg.tp1_pct = 25, 40
-        cfg.tp2, cfg.tp2_pct = 80, 30
-        cfg.tp3, cfg.tp3_pct = 200, 20
-        cfg.sl = 30
+        # wide: user-style deeper SL + later pyramid
+        cfg.exit_mode = "wide"
+        cfg.tp1, cfg.tp1_pct = 100, 50
+        cfg.tp2, cfg.tp2_pct = 200, 25
+        cfg.tp3, cfg.tp3_pct = 400, 15
+        cfg.trail_activate_pct = 150
+        cfg.trail_drawdown_pct = 15
+        cfg.hard_sl_pct = cfg.sl = 55  # 55% hard SL
         cfg.max_hold_sec = 600
+        cfg.use_default_risk = True
+        cfg.default_risk_pct = 0.75  # wider SL => smaller risk
 
 
 def build_config(
@@ -734,6 +825,14 @@ def build_config(
     max_creator_open_count: int = 20,
     reject_creator_hold: bool = False,
     enable_fake_heat: bool = True,
+    exit_mode: str | None = None,
+    hard_sl_pct: float | None = None,
+    trail_activate_pct: float | None = None,
+    trail_drawdown_pct: float | None = None,
+    use_trailing: bool = True,
+    bankroll_eth: float = 0.0,
+    max_open_exposure_pct: float = 15.0,
+    use_default_risk: bool | None = None,
 ) -> Config:
     cfg = Config(
         wallet=wallet or os.environ.get("GMGN_WALLET", "0x37e9f4a84693bce7f7729612ee91a94c91eef898"),
@@ -759,8 +858,21 @@ def build_config(
         max_creator_open_count=max_creator_open_count,
         reject_creator_hold=reject_creator_hold,
         enable_fake_heat=enable_fake_heat,
+        use_trailing=use_trailing,
+        bankroll_eth=bankroll_eth,
+        max_open_exposure_pct=max_open_exposure_pct,
     )
     apply_profile(cfg, profile, buy_eth)
+    if exit_mode:
+        cfg.exit_mode = exit_mode
+    if hard_sl_pct is not None:
+        cfg.hard_sl_pct = cfg.sl = hard_sl_pct
+    if trail_activate_pct is not None:
+        cfg.trail_activate_pct = trail_activate_pct
+    if trail_drawdown_pct is not None:
+        cfg.trail_drawdown_pct = trail_drawdown_pct
+    if use_default_risk is not None:
+        cfg.use_default_risk = use_default_risk
     if min_mc is not None:
         cfg.min_mc = min_mc
     if max_mc is not None:
@@ -786,9 +898,11 @@ def run_bot(cfg: Config) -> None:
             return
         print(f"[live_preflight] {reason}", flush=True)
     size = resolve_buy_eth(cfg)
+    br = bankroll_eth(cfg)
     print(
-        f"[size] buy_eth={size:.6f} risk_pct={cfg.risk_pct} probe_eth={cfg.probe_eth} "
-        f"sell_quote={cfg.require_sell_quote} anti_mev={cfg.anti_mev}",
+        f"[size] buy_eth={size:.6f} risk_pct={cfg.risk_pct or (cfg.default_risk_pct if cfg.use_default_risk else 0)} "
+        f"bankroll≈{br:.4f} max_open_exposure={cfg.max_open_exposure_pct}% "
+        f"probe_eth={cfg.probe_eth} sell_quote={cfg.require_sell_quote} anti_mev={cfg.anti_mev}",
         flush=True,
     )
     try:

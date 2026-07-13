@@ -11,8 +11,10 @@ safe_lp + mc_in_range + min_liq + (fresh OR reheat)
   + can_sell + buy_quote + sell_quote
   + fake_heat/creator filters
   → optional probe buy/sell
-  → sized buy (fixed or risk%)
-  → ladder TP/SL + LP/creator dump emergency exit
+  → sized buy (fixed / risk% / exposure cap)
+  → PRINCIPAL-OUT exit: ~2x sell ~55% (cost + small profit)
+    then pyramid TP + trailing remainder + hard SL
+  → LP/creator dump emergency exit
 ```
 
 Default mode is **dry-run** (quotes only). Real money requires explicit `--live`.
@@ -129,11 +131,31 @@ Override paths with `RH_SNIPER_STATE` / `RH_SNIPER_LOG`.
 
 Parameter packs from reverse engineering — **style**, not “mirror this address”.
 
-| Profile | Size default | MC band | Style |
-|---------|--------------|---------|--------|
-| `adff` | `0.03` ETH | $3k–$15k | High frequency, micro-cap, tight exits |
-| `7a23` | `0.06` ETH | $5k–$40k | Mid size, slightly more patient |
-| `417c` | `0.12` ETH | $8k–$50k | Larger size, wider ladder / reheat |
+| Profile | Size default | MC band | Exit mode | First take | Hard SL |
+|---------|--------------|---------|-----------|------------|---------|
+| `adff` | `0.03` ETH | $3k–$15k | **principal** | **2x sell 55%** | -30% |
+| `7a23` | `0.06` ETH | $5k–$40k | **principal** | **2x sell 55%** | -35% |
+| `417c` | `0.12` ETH | $8k–$50k | **wide** | 2x sell 50% | **-55%** |
+
+### Exit research note (from 3 high-PnL RH wallets)
+
+On-chain first-sell slice multiples (sell_usd / buy_cost_usd):
+
+| Wallet | First-sell median | Notes |
+|--------|-------------------|--------|
+| `0xadff…` | **~1.12x** | Fixed ~$52 size; often out near principal+ |
+| `0x7a23…` | **~1.17x** | Probe+$50–300; multi-sell common |
+| `0x417c…` | **~1.47x** | Larger ~$260; more multi-sell ladder |
+
+Default bot exit is therefore **principal-out**: first major take around **2x** sells **~55%** (recover cost + small profit), then pyramid + trail. Your **-55% hard SL** is available via `417c` or `--hard-sl 55`.
+
+### Position management
+
+- `--risk-pct 1` → size as 1% of bankroll (native or `--bankroll-eth`)
+- `--max-buy-eth` hard cap
+- `--max-open-exposure-pct 15` blocks new entries if open notional too large
+- wider SL profiles use **smaller default risk** (`417c` 0.75%)
+- Kelly upper-bound for typical 55% WR systems is huge; retail should stay **≤1–2%/trade**
 
 ```bash
 rh-sniper run -p adff
@@ -239,9 +261,17 @@ Built with **Typer** for subcommand management:
 -p / --profile adff|7a23|417c
 -w / --wallet 0x...
 --buy-eth 0.03
---risk-pct 0            # 2 = 2% of native; 0 = use buy-eth
+--risk-pct 0            # 2 = 2% of bankroll; 0 = use buy-eth
+--use-default-risk      # use profile default risk% when risk-pct=0
+--bankroll-eth 0        # 0 = native balance
 --max-buy-eth 0
+--max-open-exposure-pct 15
 --probe-eth 0           # >0 enables probe path
+--exit-mode principal|sniper|wide
+--hard-sl 35            # e.g. 55 for deep SL
+--tp-ladder 100:55,200:25,400:10
+--trail-activate 100 --trail-dd 20
+--no-trailing
 --require-sell-quote / --no-sell-quote
 --anti-mev / --no-anti-mev
 --fake-heat / --no-fake-heat
@@ -250,21 +280,22 @@ Built with **Typer** for subcommand management:
 --min-wallet-eth 0.01   # live gate
 --slippage 30
 --poll 1.0
---gate-every 2
---max-gates 2
---mon-sec-every 3
---min-mc / --max-mc
---min-liq
---fresh-max-age
---reheat-min-vol
---lp-drop-pct 35
---min-liq-hold 800
---max-hold-sec
---max-positions 3
---daily-loss-usd 100
---allow-uniswap
---live
---once
+--gate-every 2 --max-gates 2 --mon-sec-every 3
+--min-mc / --max-mc --min-liq
+--lp-drop-pct 35 --min-liq-hold 800 --max-hold-sec
+--max-positions 3 --daily-loss-usd 100
+--allow-uniswap --live --once
+```
+
+### Example: your researched stack
+
+```bash
+# principal-out + 55% hard SL + 1% risk + probe
+rh-sniper run -p 417c --use-default-risk --probe-eth 0.001 \
+  --hard-sl 55 --tp-ladder 100:55,200:25,400:10 --trail-dd 15
+
+# pure principal on micro-cap profile
+rh-sniper run -p adff --exit-mode principal --risk-pct 1 --max-buy-eth 0.03
 ```
 
 ---

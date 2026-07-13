@@ -63,10 +63,21 @@ def run(
     max_creator_open_count: int = typer.Option(20, "--max-creator-open-count", help="0 disables"),
     reject_creator_hold: bool = typer.Option(False, "--reject-creator-hold"),
     enable_fake_heat: bool = typer.Option(True, "--fake-heat/--no-fake-heat"),
+    exit_mode: Optional[str] = typer.Option(None, "--exit-mode", help="principal|sniper|wide (override profile)"),
+    hard_sl_pct: Optional[float] = typer.Option(None, "--hard-sl", help="Hard stop-loss percent, e.g. 55"),
+    trail_activate_pct: Optional[float] = typer.Option(None, "--trail-activate", help="Activate trailing after +X%"),
+    trail_drawdown_pct: Optional[float] = typer.Option(None, "--trail-dd", help="Trailing giveback from peak %"),
+    no_trailing: bool = typer.Option(False, "--no-trailing"),
+    bankroll_eth: float = typer.Option(0.0, "--bankroll-eth", help="Bankroll for risk sizing; 0=native bal"),
+    max_open_exposure_pct: float = typer.Option(15.0, "--max-open-exposure-pct"),
+    use_default_risk: bool = typer.Option(False, "--use-default-risk", help="Use profile default risk% if --risk-pct not set"),
+    tp_ladder: Optional[str] = typer.Option(None, "--tp-ladder", help="e.g. 100:55,200:25,400:10"),
 ) -> None:
     """Start the sniper (dry-run unless --live)."""
     if profile not in {"adff", "7a23", "417c"}:
         raise typer.BadParameter("profile must be adff | 7a23 | 417c")
+    if exit_mode and exit_mode not in {"principal", "sniper", "wide"}:
+        raise typer.BadParameter("exit-mode must be principal|sniper|wide")
     cfg = build_config(
         wallet=wallet,
         profile=profile,
@@ -98,7 +109,26 @@ def run(
         max_creator_open_count=max_creator_open_count,
         reject_creator_hold=reject_creator_hold,
         enable_fake_heat=enable_fake_heat,
+        exit_mode=exit_mode,
+        hard_sl_pct=hard_sl_pct,
+        trail_activate_pct=trail_activate_pct,
+        trail_drawdown_pct=trail_drawdown_pct,
+        use_trailing=not no_trailing,
+        bankroll_eth=bankroll_eth,
+        max_open_exposure_pct=max_open_exposure_pct,
+        use_default_risk=use_default_risk if use_default_risk else None,
     )
+    if tp_ladder:
+        parts = []
+        for chunk in tp_ladder.split(","):
+            a, b = chunk.split(":")
+            parts.append((float(a), float(b)))
+        if len(parts) >= 1:
+            cfg.tp1, cfg.tp1_pct = parts[0]
+        if len(parts) >= 2:
+            cfg.tp2, cfg.tp2_pct = parts[1]
+        if len(parts) >= 3:
+            cfg.tp3, cfg.tp3_pct = parts[2]
     run_bot(cfg)
 
 
