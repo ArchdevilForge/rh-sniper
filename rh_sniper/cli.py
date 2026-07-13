@@ -54,6 +54,7 @@ def run(
     allow_uniswap: bool = typer.Option(False, "--allow-uniswap", help="Allow naked Uni pools"),
     live: bool = typer.Option(False, "--live", help="REAL money (off by default)"),
     once: bool = typer.Option(False, "--once", help="Single cycle then exit"),
+    paper_positions: bool = typer.Option(False, "--paper-positions", help="Track positions in dry-run (default off)"),
     require_sell_quote: bool = typer.Option(True, "--require-sell-quote/--no-sell-quote", help="Require token->NATIVE quote"),
     probe_eth: float = typer.Option(0.0, "--probe-eth", help="Probe size; >0 enables probe buy/sell before full size"),
     risk_pct: float = typer.Option(0.0, "--risk-pct", help="Size as % of native (2=2%); 0=use --buy-eth"),
@@ -112,6 +113,7 @@ def run(
         allow_uniswap=allow_uniswap,
         live=live,
         once=once,
+        paper_positions=paper_positions,
         require_sell_quote=require_sell_quote,
         probe_eth=probe_eth,
         risk_pct=risk_pct,
@@ -210,8 +212,8 @@ def stats() -> None:
         typer.echo(f"no events in {s.get('log', LOG_PATH)}")
         raise typer.Exit(1)
     typer.echo(f"log: {s['log']}")
-    typer.echo(f"events: {s['events']}  buys: {s['buys']}  emergency_sells: {s['emergency_sells']}")
-    typer.echo(f"probes_ok: {s['probes_ok']}  probes_fail: {s['probes_fail']}")
+    typer.echo(f"events: {s['events']}  buys: {s['buys']}  buy_failed: {s.get('buy_failed',0)}  emergency_sells: {s['emergency_sells']}")
+    typer.echo(f"probes_ok: {s['probes_ok']}  probes_fail: {s['probes_fail']}  rate_limits: {s.get('rate_limits',0)}")
     typer.echo(f"counts: {s.get('counts')}")
     typer.echo("top reject reasons:")
     for k, v in (s.get("reject_reasons") or {}).items():

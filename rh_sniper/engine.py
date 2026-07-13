@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Robinhood sniper engine — strategy replica + P0/P1 risk system."""
+"""Robinhood sniper engine — HF reverse strategy + v0.4 live hardening."""
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import time
 from dataclasses import dataclass
@@ -12,18 +13,17 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 NATIVE = "0x0000000000000000000000000000000000000000"
-STATE_PATH = Path(os.environ.get("RH_SNIPER_STATE", "state.json")).expanduser()
-LOG_PATH = Path(os.environ.get("RH_SNIPER_LOG", "trades.jsonl")).expanduser()
 SAFE_LP = ("noxa", "bankr", "trench", "virtuals", "flap")
 
+# Paths resolved in configure_runtime() after live/dry known
+STATE_PATH = Path(os.environ.get("RH_SNIPER_STATE", "state.json")).expanduser()
+LOG_PATH = Path(os.environ.get("RH_SNIPER_LOG", "trades.jsonl")).expanduser()
 
-def sh(args: list[str], timeout: int = 60) -> dict | list | None:
-    p = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
-    if p.returncode != 0:
-        err = (p.stderr or p.stdout or "").strip()
-        raise RuntimeError(f"cmd failed ({p.returncode}): {' '.join(args)}\n{err[:500]}")
-    out = (p.stdout or "").strip()
-    return json.loads(out) if out else None
+
+class RateLimitError(RuntimeError):
+    def __init__(self, message: str, sleep_s: float = 60.0):
+        super().__init__(message)
+        self.sleep_s = sleep_s
 
 
 def fnum(x, default=0.0) -> float:
@@ -31,6 +31,45 @@ def fnum(x, default=0.0) -> float:
         return float(x)
     except Exception:
         return default
+
+
+def _parse_rate_limit_sleep(text: str) -> float | None:
+    if not text:
+        return None
+    low = text.lower()
+    if "429" not in text and "rate_limit" not in low and "rate limit" not in low and "rate-limit" not in low:
+        return None
+    m = re.search(r"reset_at[\"']?\s*[:=]\s*(\d{10,})", text)
+    if m:
+        return max(5.0, min(300.0, int(m.group(1)) - time.time() + 1))
+    m = re.search(r"x-ratelimit-reset[\"']?\s*[:=]\s*(\d{10,})", text, re.I)
+    if m:
+        return max(5.0, min(300.0, int(m.group(1)) - time.time() + 1))
+    m = re.search(r"retry(?:ing)?(?: once)? in (\d+(?:\.\d+)?)s", text, re.I)
+    if m:
+        return max(5.0, float(m.group(1)))
+    return 60.0
+
+
+def sh(args: list[str], timeout: int = 60, retries: int = 1) -> dict | list | None:
+    last_err = ""
+    for attempt in range(max(1, retries + 1)):
+        p = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        out = (p.stdout or "").strip()
+        err = (p.stderr or "").strip()
+        blob = (err + "\n" + out).strip()
+        if p.returncode == 0:
+            return json.loads(out) if out else None
+        last_err = blob
+        sleep_s = _parse_rate_limit_sleep(blob)
+        if sleep_s is not None:
+            if attempt < retries:
+                print(f"[rate_limit] sleep {sleep_s:.0f}s then retry {attempt+1}/{retries}", flush=True)
+                time.sleep(sleep_s)
+                continue
+            raise RateLimitError(f"rate limited: {blob[:300]}", sleep_s=sleep_s)
+        raise RuntimeError(f"cmd failed ({p.returncode}): {' '.join(args)}\n{blob[:500]}")
+    raise RuntimeError(f"cmd failed: {' '.join(args)}\n{last_err[:500]}")
 
 
 @dataclass
@@ -62,23 +101,21 @@ class Config:
     max_hold_sec: int = 300
     require_can_sell: bool = True
     only_safe_lp: bool = True
-    # Exit plan: principal-out first, then pyramid scale-out + trailing
-    exit_mode: str = "hf_scale"  # hf_full | hf_scale | principal | wide
-    tp1: float = 100          # +100% = 2x
-    tp1_pct: float = 55       # sell ~55% (principal + small profit)
-    tp2: float = 200
-    tp2_pct: float = 25
-    tp3: float = 400
-    tp3_pct: float = 10
-    # remainder ~10% trailing
-    trail_activate_pct: float = 100
-    trail_drawdown_pct: float = 20
-    hard_sl_pct: float = 35   # fixed hard stop (was sl)
-    sl: float = 35            # alias used in logs / legacy
+    exit_mode: str = "hf_scale"
+    tp1: float = 30
+    tp1_pct: float = 25
+    tp2: float = 80
+    tp2_pct: float = 30
+    tp3: float = 150
+    tp3_pct: float = 25
+    trail_activate_pct: float = 80
+    trail_drawdown_pct: float = 25
+    hard_sl_pct: float = 35
+    sl: float = 35
     use_trailing: bool = True
     live: bool = False
     once: bool = False
-    paper_positions: bool = True
+    paper_positions: bool = False  # dry-run default: do NOT pollute positions
     require_sell_quote: bool = True
     probe_eth: float = 0.0
     risk_pct: float = 0.0
@@ -93,22 +130,49 @@ class Config:
     fake_heat_min_vol_1h: float = 20000.0
     fake_heat_max_price_change_1h: float = 0.05
     enable_fake_heat: bool = True
-    # Position management
-    bankroll_eth: float = 0.0       # 0 => native balance
-    max_open_exposure_pct: float = 15.0  # sum open buy_eth / bankroll
-    default_risk_pct: float = 1.0   # if risk_pct==0 and use_default_risk
+    bankroll_eth: float = 0.0
+    max_open_exposure_pct: float = 15.0
+    default_risk_pct: float = 1.0
     use_default_risk: bool = False
-    # Session window (China time UTC+8). Only hunt in-window; off-hours rest or slow mon.
-    active_hours_cn: str = "18-4"  # main session 18:00–04:00 CN; empty = 24h
-    offhours_mode: str = "sleep"  # sleep | mon | off
-    offhours_poll_sec: float = 60.0  # only used if offhours_mode=mon
-    timezone_offset_hours: int = 8  # CN default
+    active_hours_cn: str = "18-4"
+    offhours_mode: str = "sleep"
+    offhours_poll_sec: float = 60.0
+    timezone_offset_hours: int = 8
+    # v0.4 hardening
+    confirm_orders: bool = True
+    order_confirm_timeout_s: float = 45.0
+    order_confirm_poll_s: float = 2.0
+    pnl_refresh_every: int = 15  # ticks
+    local_exit_if_no_strategy: bool = True
+
+
+def configure_runtime(cfg: Config) -> None:
+    """Isolate dry/live state+log files unless env overrides."""
+    global STATE_PATH, LOG_PATH
+    if os.environ.get("RH_SNIPER_STATE"):
+        STATE_PATH = Path(os.environ["RH_SNIPER_STATE"]).expanduser()
+    else:
+        STATE_PATH = Path("state.live.json" if cfg.live else "state.dry.json")
+    if os.environ.get("RH_SNIPER_LOG"):
+        LOG_PATH = Path(os.environ["RH_SNIPER_LOG"]).expanduser()
+    else:
+        LOG_PATH = Path("trades.live.jsonl" if cfg.live else "trades.dry.jsonl")
+    # live always tracks positions; dry only if paper_positions
+    if cfg.live:
+        cfg.paper_positions = True
 
 
 def load_state() -> dict:
     if STATE_PATH.exists():
         return json.loads(STATE_PATH.read_text())
-    return {"seen": {}, "positions": {}, "day": time.strftime("%Y-%m-%d"), "day_realized_est": 0.0, "buys_today": 0}
+    return {
+        "seen": {},
+        "positions": {},
+        "day": time.strftime("%Y-%m-%d"),
+        "day_realized_est": 0.0,
+        "buys_today": 0,
+        "session_start_realized": None,
+    }
 
 
 def save_state(st: dict) -> None:
@@ -121,33 +185,13 @@ def log_event(obj: dict) -> None:
 
 
 def condition_orders(cfg: Config) -> str:
-    """Build TP/SL ladder.
-
-    principal mode (default, matched to reversed wallets + user theory):
-      - first scale-out near 2x sells majority of bag (principal + small profit)
-      - further pyramid TPs
-      - hard SL
-      - trailing on remaining after trail_activate
-
-    Note: GMGN condition-orders cannot truly "move SL to breakeven after TP1"
-    as a dependency graph; we approximate with fixed ladder + trailing remainder.
-    """
     sl = int(cfg.hard_sl_pct or cfg.sl or 35)
     orders = []
-    for scale, ratio in (
-        (cfg.tp1, cfg.tp1_pct),
-        (cfg.tp2, cfg.tp2_pct),
-        (cfg.tp3, cfg.tp3_pct),
-    ):
+    for scale, ratio in ((cfg.tp1, cfg.tp1_pct), (cfg.tp2, cfg.tp2_pct), (cfg.tp3, cfg.tp3_pct)):
         r = int(ratio)
         if r <= 0:
             continue
-        orders.append({
-            "order_type": "profit_stop",
-            "side": "sell",
-            "price_scale": str(int(scale)),
-            "sell_ratio": str(r),
-        })
+        orders.append({"order_type": "profit_stop", "side": "sell", "price_scale": str(int(scale)), "sell_ratio": str(r)})
     orders.append({"order_type": "loss_stop", "side": "sell", "price_scale": str(sl), "sell_ratio": "100"})
     sold = sum(int(x) for x in (cfg.tp1_pct, cfg.tp2_pct, cfg.tp3_pct))
     rem = max(0, 100 - sold)
@@ -159,8 +203,7 @@ def condition_orders(cfg: Config) -> str:
             "sell_ratio": str(rem),
             "drawdown_rate": str(int(cfg.trail_drawdown_pct)),
         })
-    elif rem > 0 and orders:
-        # add remainder onto last TP leg
+    elif rem > 0:
         for o in reversed(orders):
             if o.get("order_type") == "profit_stop":
                 o["sell_ratio"] = str(int(o["sell_ratio"]) + rem)
@@ -180,11 +223,73 @@ def quote(cfg: Config, input_token: str, output_token: str, amount_wei: str, sli
         "--amount", amount_wei,
         "--slippage", str(slippage if slippage is not None else cfg.slippage),
         "--raw",
-    ]) or {}
+    ], retries=1) or {}
+
+
+def extract_order_id(result: dict | None) -> str | None:
+    if not isinstance(result, dict):
+        return None
+    for k in ("order_id", "orderId", "id"):
+        if result.get(k):
+            return str(result.get(k))
+    # nested
+    for nest in ("data", "result", "order"):
+        n = result.get(nest)
+        if isinstance(n, dict):
+            for k in ("order_id", "orderId", "id"):
+                if n.get(k):
+                    return str(n.get(k))
+    return None
+
+
+def extract_strategy_id(result: dict | None) -> str | None:
+    if not isinstance(result, dict):
+        return None
+    for k in ("strategy_order_id", "strategyOrderId"):
+        if result.get(k):
+            return str(result.get(k))
+    for nest in ("data", "result"):
+        n = result.get(nest)
+        if isinstance(n, dict) and n.get("strategy_order_id"):
+            return str(n.get("strategy_order_id"))
+    return None
+
+
+def wait_order(cfg: Config, order_id: str | None) -> dict:
+    """Poll order get until confirmed/failed/timeout."""
+    if not order_id or not cfg.confirm_orders:
+        return {"status": "skipped", "order_id": order_id}
+    deadline = time.time() + cfg.order_confirm_timeout_s
+    last: dict = {}
+    while time.time() < deadline:
+        try:
+            last = sh([
+                "gmgn-cli", "order", "get",
+                "--chain", cfg.chain,
+                "--order-id", order_id,
+                "--raw",
+            ], retries=0) or {}
+        except RateLimitError as e:
+            raise
+        except Exception as e:
+            last = {"status": "query_error", "error": str(e)[:200]}
+            time.sleep(cfg.order_confirm_poll_s)
+            continue
+        status = str(last.get("status") or last.get("state") or "").lower()
+        # common success markers
+        if status in ("confirmed", "successful", "success", "filled", "done"):
+            return {**last, "status": "confirmed"}
+        if status in ("failed", "fail", "expired", "error", "cancelled", "canceled"):
+            return {**last, "status": "failed"}
+        # numeric state sometimes 30=success per docs
+        if str(last.get("state")) == "30" or last.get("status") == "successful":
+            return {**last, "status": "confirmed"}
+        time.sleep(cfg.order_confirm_poll_s)
+    return {**(last or {}), "status": "timeout", "order_id": order_id}
 
 
 def native_balance_eth(cfg: Config) -> float:
-    info = sh(["gmgn-cli", "portfolio", "info", "--raw"]) or {}
+    info = sh(["gmgn-cli", "portfolio", "info", "--raw"], retries=1) or {}
     wallet = (cfg.wallet or "").lower()
     for w in info.get("wallets") or []:
         if (w.get("chain") or "").lower() != cfg.chain.lower():
@@ -210,11 +315,6 @@ def bankroll_eth(cfg: Config) -> float:
 
 
 def resolve_buy_eth(cfg: Config) -> float:
-    """Fixed buy_eth, or risk_pct of bankroll (native or --bankroll-eth).
-
-    If risk mode is on but bankroll is 0 (empty wallet / dry-run), fall back to buy_eth
-    so dry-runs still size correctly.
-    """
     risk = cfg.risk_pct
     if (not risk or risk <= 0) and cfg.use_default_risk and cfg.default_risk_pct > 0:
         risk = cfg.default_risk_pct
@@ -232,7 +332,6 @@ def resolve_buy_eth(cfg: Config) -> float:
 
 
 def exposure_ok(cfg: Config, st: dict, next_buy_eth: float) -> tuple[bool, str]:
-    """Cap aggregate open exposure vs bankroll."""
     if cfg.max_open_exposure_pct <= 0:
         return True, "ok"
     br = bankroll_eth(cfg)
@@ -257,6 +356,33 @@ def live_preflight(cfg: Config) -> tuple[bool, str]:
         if bal < need:
             return False, f"insufficient_native bal={bal:.6f} need>={need:.6f}"
     return True, "ok"
+
+
+def refresh_day_pnl(cfg: Config, st: dict) -> None:
+    """Best-effort day realized from portfolio stats 7d (delta from session start)."""
+    if not cfg.live:
+        return
+    try:
+        stats = sh([
+            "gmgn-cli", "portfolio", "stats",
+            "--chain", cfg.chain,
+            "--wallet", cfg.wallet,
+            "--period", "7d",
+            "--raw",
+        ], retries=0) or {}
+        # batch may return list
+        if isinstance(stats, list) and stats:
+            stats = stats[0]
+        realized = fnum(stats.get("realized_profit"))
+        if st.get("session_start_realized") is None:
+            st["session_start_realized"] = realized
+        st["day_realized_est"] = realized - fnum(st.get("session_start_realized"))
+        st["last_pnl_refresh"] = int(time.time())
+        log_event({"event": "pnl_refresh", "realized_7d": realized, "day_realized_est": st["day_realized_est"]})
+    except RateLimitError:
+        raise
+    except Exception as e:
+        log_event({"event": "pnl_refresh_error", "error": str(e)[:200]})
 
 
 def estimate_mc(token_row: dict, info: dict | None = None) -> float:
@@ -317,19 +443,17 @@ def creator_reject(cfg: Config, snap: dict) -> str | None:
 
 def token_snapshot(cfg: Config, address: str, token_row: dict | None = None, with_security: bool = True) -> dict:
     token_row = token_row or {}
-    info = sh(["gmgn-cli", "token", "info", "--chain", cfg.chain, "--address", address, "--raw"])
+    info = sh(["gmgn-cli", "token", "info", "--chain", cfg.chain, "--address", address, "--raw"], retries=1)
     sec: dict = {}
     if with_security:
         try:
-            sec = sh(["gmgn-cli", "token", "security", "--chain", cfg.chain, "--address", address, "--raw"]) or {}
+            sec = sh(["gmgn-cli", "token", "security", "--chain", cfg.chain, "--address", address, "--raw"], retries=0) or {}
         except Exception as e:
             sec = {"_error": str(e)[:200]}
-
     liq = fnum((info or {}).get("liquidity"))
     pool = (info or {}).get("pool") or {}
     if not liq:
         liq = fnum(pool.get("liquidity") or token_row.get("liquidity"))
-
     can_sell = sec.get("can_sell")
     sellable = can_sell in (True, 1, "1", "yes", "YES", None)
     honeypot = sec.get("is_honeypot") in (True, 1, "1", "yes", "YES") or sec.get("honeypot") in (True, 1, "1", "yes")
@@ -337,13 +461,11 @@ def token_snapshot(cfg: Config, address: str, token_row: dict | None = None, wit
         sellable = False
     if honeypot:
         sellable = False
-
     top10 = fnum(sec.get("top_10_holder_rate"))
     if not top10 and isinstance((info or {}).get("stat"), dict):
         top10 = fnum((info or {})["stat"].get("top_10_holder_rate"))
     if not top10:
         top10 = fnum(token_row.get("top_10_holder_rate"))
-
     created = int((info or {}).get("creation_timestamp") or token_row.get("created_timestamp") or 0)
     opened = int((info or {}).get("open_timestamp") or token_row.get("open_timestamp") or 0)
     now = int(time.time())
@@ -478,7 +600,7 @@ def fetch_candidates(cfg: Config) -> list[dict]:
         "--chain", cfg.chain,
         "--type", "new_creation", "--type", "completed", "--type", "near_completion",
         "--limit", "50", "--raw",
-    ])
+    ], retries=1)
     now = int(time.time())
     out: list[dict] = []
     if not isinstance(data, dict):
@@ -526,7 +648,17 @@ def buy(cfg: Config, token: str, symbol: str, buy_eth: float | None = None) -> d
     cond = condition_orders(cfg)
     if not cfg.live:
         q = quote(cfg, NATIVE, token, amount, cfg.slippage)
-        return {"mode": "dry-run", "symbol": symbol, "token": token, "buy_eth": size, "amount_wei": amount, "quote_ok": bool(q), "quote_out": q.get("output_amount")}
+        return {
+            "mode": "dry-run",
+            "symbol": symbol,
+            "token": token,
+            "buy_eth": size,
+            "amount_wei": amount,
+            "quote_ok": bool(q),
+            "quote_out": q.get("output_amount"),
+            "order_status": "dry-run",
+            "strategy_ok": True,
+        }
     cmd = [
         "gmgn-cli", "swap", "--chain", cfg.chain, "--from", cfg.wallet,
         "--input-token", NATIVE, "--output-token", token, "--amount", amount,
@@ -535,7 +667,27 @@ def buy(cfg: Config, token: str, symbol: str, buy_eth: float | None = None) -> d
     if cfg.anti_mev:
         cmd.append("--anti-mev")
     cmd.append("--raw")
-    return {"mode": "live", "symbol": symbol, "token": token, "buy_eth": size, "result": sh(cmd, timeout=90)}
+    result = sh(cmd, timeout=90, retries=0)
+    oid = extract_order_id(result if isinstance(result, dict) else None)
+    sid = extract_strategy_id(result if isinstance(result, dict) else None)
+    conf = wait_order(cfg, oid)
+    out = {
+        "mode": "live",
+        "symbol": symbol,
+        "token": token,
+        "buy_eth": size,
+        "result": result,
+        "order_id": oid,
+        "strategy_order_id": sid,
+        "order_status": conf.get("status"),
+        "strategy_ok": bool(sid),
+    }
+    if conf.get("status") == "failed":
+        out["error"] = "order_failed"
+    if cfg.local_exit_if_no_strategy and not sid:
+        out["warn"] = "no_strategy_order_id"
+        log_event({"event": "strategy_missing", "token": token, "symbol": symbol, "order_id": oid})
+    return out
 
 
 def emergency_sell(cfg: Config, token: str, symbol: str, reason: str) -> dict:
@@ -549,7 +701,19 @@ def emergency_sell(cfg: Config, token: str, symbol: str, reason: str) -> dict:
     if cfg.anti_mev:
         cmd.append("--anti-mev")
     cmd.append("--raw")
-    return {"mode": "live", "event": "emergency_sell", "symbol": symbol, "token": token, "reason": reason, "result": sh(cmd, timeout=90)}
+    result = sh(cmd, timeout=90, retries=0)
+    oid = extract_order_id(result if isinstance(result, dict) else None)
+    conf = wait_order(cfg, oid)
+    return {
+        "mode": "live",
+        "event": "emergency_sell",
+        "symbol": symbol,
+        "token": token,
+        "reason": reason,
+        "result": result,
+        "order_id": oid,
+        "order_status": conf.get("status"),
+    }
 
 
 def probe_trade(cfg: Config, token: str, symbol: str) -> tuple[bool, str, dict]:
@@ -573,13 +737,19 @@ def probe_trade(cfg: Config, token: str, symbol: str) -> tuple[bool, str, dict]:
         if cfg.anti_mev:
             buy_cmd.append("--anti-mev")
         buy_cmd.append("--raw")
-        meta["buy_result"] = sh(buy_cmd, timeout=90)
+        br = sh(buy_cmd, timeout=90, retries=0)
+        meta["buy_result"] = br
+        meta["buy_order"] = wait_order(cfg, extract_order_id(br if isinstance(br, dict) else None))
         sell_cmd = ["gmgn-cli", "swap", "--chain", cfg.chain, "--from", cfg.wallet, "--input-token", token, "--output-token", NATIVE, "--percent", "100", "--slippage", str(cfg.emergency_slippage)]
         if cfg.anti_mev:
             sell_cmd.append("--anti-mev")
         sell_cmd.append("--raw")
-        meta["sell_result"] = sh(sell_cmd, timeout=90)
+        sr = sh(sell_cmd, timeout=90, retries=0)
+        meta["sell_result"] = sr
+        meta["sell_order"] = wait_order(cfg, extract_order_id(sr if isinstance(sr, dict) else None))
         meta["mode"] = "live"
+        if meta.get("sell_order", {}).get("status") == "failed":
+            return False, "probe_sell_failed", meta
         return True, "probe_ok", meta
     except Exception as e:
         try:
@@ -595,6 +765,9 @@ def monitor_positions(cfg: Config, st: dict, with_security: bool = False) -> Non
         return
     dead = []
     for addr, meta in list(pos.items()):
+        # skip pure dry paper markers if any leaked
+        if meta.get("mode") == "dry-run" and not cfg.live:
+            continue
         sym = meta.get("symbol") or "?"
         entry_liq = fnum(meta.get("entry_liq"))
         bought_at = int(meta.get("ts") or 0)
@@ -615,11 +788,23 @@ def monitor_positions(cfg: Config, st: dict, with_security: bool = False) -> Non
             reason = f"liq_floor_{liq:.0f}"
         elif held >= cfg.max_hold_sec:
             reason = f"max_hold_{held}s"
+        # local exit if strategy missing and held long enough
+        if (
+            cfg.live
+            and cfg.local_exit_if_no_strategy
+            and meta.get("strategy_ok") is False
+            and held >= min(60, cfg.max_hold_sec)
+        ):
+            reason = reason or "no_strategy_timeout"
         entry_cbal = fnum(meta.get("creator_token_balance"))
         cbal = fnum(snap.get("creator_token_balance"))
         if with_security and entry_cbal > 0 and cbal < entry_cbal * 0.5:
             reason = reason or f"creator_dump {entry_cbal:.0f}->{cbal:.0f}"
-        print(f"[mon] {sym} held={held}s liq={liq:.0f} entry={entry_liq:.0f} drop={drop:.1f}% sec={int(with_security)} can_sell={snap['can_sell']}", flush=True)
+        print(
+            f"[mon] {sym} held={held}s liq={liq:.0f} entry={entry_liq:.0f} drop={drop:.1f}% "
+            f"sec={int(with_security)} can_sell={snap['can_sell']}",
+            flush=True,
+        )
         if not reason:
             meta["last_liq"] = liq
             meta["last_check"] = int(time.time())
@@ -631,6 +816,7 @@ def monitor_positions(cfg: Config, st: dict, with_security: bool = False) -> Non
         try:
             res = emergency_sell(cfg, addr, sym, reason)
             log_event({**res, "entry_liq": entry_liq, "liq": liq, "drop_pct": drop, "held": held})
+            # crude pnl: if live sell, mark day est change unknown; rely on refresh
             dead.append(addr)
         except Exception as e:
             log_event({"event": "emergency_sell_error", "token": addr, "symbol": sym, "error": str(e)[:300]})
@@ -650,13 +836,10 @@ def rollover_day(st: dict) -> None:
         st["day"] = day
         st["day_realized_est"] = 0.0
         st["buys_today"] = 0
-
+        st["session_start_realized"] = None
 
 
 def parse_active_hours_cn(spec: str) -> list[tuple[int, int]] | None:
-    """Parse '18-4' or '18-21,8-12' into [(start,end),...] end exclusive in hour grid with wrap.
-    Empty/none/all/24h => None (always active).
-    """
     if not spec:
         return None
     s = spec.strip().lower()
@@ -682,19 +865,17 @@ def hour_in_windows(hour: int, windows: list[tuple[int, int]] | None) -> bool:
         return True
     for start, end in windows:
         if start == end:
-            return True  # 24h degenerate
+            return True
         if start < end:
             if start <= hour < end:
                 return True
         else:
-            # wrap: e.g. 18-4 means 18..23 and 0..3
             if hour >= start or hour < end:
                 return True
     return False
 
 
 def is_active_session(cfg: Config, now: datetime | None = None) -> tuple[bool, int, str]:
-    """Return (active, local_hour, label)."""
     tz = timezone(timedelta(hours=int(cfg.timezone_offset_hours)))
     now = now or datetime.now(tz=timezone.utc)
     local = now.astimezone(tz)
@@ -708,13 +889,20 @@ def is_active_session(cfg: Config, now: datetime | None = None) -> tuple[bool, i
     return active, hour, label
 
 
-
 def loop(cfg: Config) -> None:
     st = load_state()
     tick = 0
     est = 3 + cfg.max_positions + (4 * cfg.max_gates_per_tick) / max(cfg.gate_every, 1)
-    print(f"[start] profile={cfg.profile} buy={cfg.buy_eth}ETH mc=[{cfg.min_mc:.0f},{cfg.max_mc:.0f}] fresh<={cfg.fresh_max_age_sec}s reheat_vol>={cfg.reheat_min_vol_1h} min_liq={cfg.min_liquidity} live={cfg.live}", flush=True)
-    print(f"[pace] poll={cfg.poll_sec}s gate_every={cfg.gate_every} max_gates={cfg.max_gates_per_tick} mon_sec_every={cfg.mon_security_every} ~weight/s≈{est / cfg.poll_sec:.1f} (cap 20)", flush=True)
+    print(
+        f"[start] profile={cfg.profile} buy={cfg.buy_eth}ETH mc=[{cfg.min_mc:.0f},{cfg.max_mc:.0f}] "
+        f"fresh<={cfg.fresh_max_age_sec}s reheat_vol>={cfg.reheat_min_vol_1h} min_liq={cfg.min_liquidity} live={cfg.live}",
+        flush=True,
+    )
+    print(
+        f"[pace] poll={cfg.poll_sec}s gate_every={cfg.gate_every} max_gates={cfg.max_gates_per_tick} "
+        f"mon_sec_every={cfg.mon_security_every} ~weight/s≈{est / cfg.poll_sec:.1f} (cap 20)",
+        flush=True,
+    )
     print(
         f"[exits] mode={cfg.exit_mode} TP {cfg.tp1}/{cfg.tp1_pct}+{cfg.tp2}/{cfg.tp2_pct}+{cfg.tp3}/{cfg.tp3_pct} "
         f"trail@{cfg.trail_activate_pct}% dd{cfg.trail_drawdown_pct}% SL -{cfg.hard_sl_pct}% "
@@ -726,120 +914,184 @@ def loop(cfg: Config) -> None:
         f"tz=UTC+{cfg.timezone_offset_hours}",
         flush=True,
     )
+    print(f"[runtime] state={STATE_PATH} log={LOG_PATH} paper_positions={cfg.paper_positions}", flush=True)
+
+    rate_limit_until = 0.0
+
     while True:
         t0 = time.time()
         tick += 1
-        rollover_day(st)
-        prune_seen(st)
-
-        active, local_hour, sess_label = is_active_session(cfg)
-        # Always monitor open positions (even off-hours) so exits still work
-        do_sec = (tick % max(cfg.mon_security_every, 1) == 0) or cfg.once or (not active and bool(st.get("positions")))
         try:
-            monitor_positions(cfg, st, with_security=do_sec)
-        except Exception as e:
-            print(f"[mon_loop_err] {e}", flush=True)
-        save_state(st)
+            if time.time() < rate_limit_until:
+                sleep_left = rate_limit_until - time.time()
+                print(f"[rate_limit] cooling {sleep_left:.0f}s", flush=True)
+                time.sleep(max(1.0, sleep_left))
+                continue
 
-        open_n = len(st.get("positions") or {})
-        if st.get("day_realized_est", 0) <= -abs(cfg.daily_loss_usd):
-            print(f"[halt] daily loss limit: {st['day_realized_est']}", flush=True)
+            rollover_day(st)
+            prune_seen(st)
+
+            if cfg.live and (tick % max(cfg.pnl_refresh_every, 1) == 1 or cfg.once):
+                refresh_day_pnl(cfg, st)
+
+            active, local_hour, sess_label = is_active_session(cfg)
+            do_sec = (tick % max(cfg.mon_security_every, 1) == 0) or cfg.once or (not active and bool(st.get("positions")))
+            try:
+                monitor_positions(cfg, st, with_security=do_sec)
+            except RateLimitError as e:
+                rate_limit_until = time.time() + e.sleep_s
+                log_event({"event": "rate_limit", "sleep_s": e.sleep_s, "where": "monitor"})
+                continue
+            except Exception as e:
+                print(f"[mon_loop_err] {e}", flush=True)
+            save_state(st)
+
+            open_n = len(st.get("positions") or {})
+            if st.get("day_realized_est", 0) <= -abs(cfg.daily_loss_usd):
+                print(f"[halt] daily loss limit: {st['day_realized_est']}", flush=True)
+                if cfg.once:
+                    break
+                time.sleep(max(0.0, cfg.poll_sec - (time.time() - t0)))
+                continue
+
+            if not active and not cfg.once:
+                if open_n:
+                    sleep_s = min(cfg.poll_sec * 2, 15.0)
+                    if tick % 10 == 1:
+                        print(f"[rest] {sess_label} open={open_n} mon-only sleep={sleep_s}s", flush=True)
+                    time.sleep(max(0.0, sleep_s - (time.time() - t0)))
+                    continue
+                sleep_s = max(30.0, float(cfg.offhours_poll_sec))
+                if tick % 3 == 1:
+                    print(f"[rest] {sess_label} no new entries, sleep={sleep_s:.0f}s", flush=True)
+                time.sleep(max(0.0, sleep_s - (time.time() - t0)))
+                continue
+
+            if open_n < cfg.max_positions:
+                try:
+                    cands = fetch_candidates(cfg)
+                except RateLimitError as e:
+                    rate_limit_until = time.time() + e.sleep_s
+                    log_event({"event": "rate_limit", "sleep_s": e.sleep_s, "where": "trenches"})
+                    continue
+                except Exception as e:
+                    print(f"[err] trenches: {e}", flush=True)
+                    cands = []
+                print(
+                    f"[scan] tick={tick} cands={len(cands)} open={open_n} buys_today={st.get('buys_today', 0)} "
+                    f"gate={'Y' if tick % max(cfg.gate_every, 1) == 0 or cfg.once else 'N'} day_pnl={st.get('day_realized_est', 0):.2f}",
+                    flush=True,
+                )
+                if cands and (tick % max(cfg.gate_every, 1) == 0 or cfg.once):
+                    checked = 0
+                    try:
+                        for tok in cands:
+                            if checked >= cfg.max_gates_per_tick:
+                                break
+                            addr = tok["address"].lower()
+                            if addr in st["seen"] or addr in (st.get("positions") or {}):
+                                continue
+                            sym = tok.get("symbol") or "?"
+                            checked += 1
+                            try:
+                                ok, reason, snap = pre_entry_gate(cfg, tok)
+                            except RateLimitError as e:
+                                rate_limit_until = time.time() + e.sleep_s
+                                log_event({"event": "rate_limit", "sleep_s": e.sleep_s, "where": "gate"})
+                                break
+                            st["seen"][addr] = int(time.time())
+                            if not ok:
+                                log_event({
+                                    "event": "reject", "token": addr, "symbol": sym, "reason": reason,
+                                    "mc": snap.get("mc"), "liq": snap.get("liquidity"),
+                                    "age": snap.get("age"), "lp": snap.get("launchpad") or tok.get("_lp"),
+                                })
+                                print(f"[reject] {sym} {reason} mc={snap.get('mc', 0):.0f} liq={snap.get('liquidity', 0):.0f}", flush=True)
+                                continue
+                            print(
+                                f"[signal] {sym} mode={snap.get('entry_mode')} mc=${snap.get('mc', 0):.0f} "
+                                f"liq={snap.get('liquidity', 0):.0f} buy={snap.get('buy_eth', cfg.buy_eth)} "
+                                f"age={snap.get('age')} {snap.get('entry_why')} {addr[:12]}…",
+                                flush=True,
+                            )
+                            try:
+                                if cfg.probe_eth > 0:
+                                    pok, preason, pmeta = probe_trade(cfg, tok["address"], sym)
+                                    log_event({
+                                        "event": "probe", "ok": pok, "reason": preason, "symbol": sym,
+                                        "token": addr, "probe_eth": pmeta.get("probe_eth"), "mode": pmeta.get("mode"),
+                                    })
+                                    if not pok:
+                                        print(f"[probe_fail] {sym} {preason}", flush=True)
+                                        continue
+                                    print(f"[probe_ok] {sym} {preason}", flush=True)
+                                next_size = float(snap.get("buy_eth") or resolve_buy_eth(cfg))
+                                ok_exp, exp_reason = exposure_ok(cfg, st, next_size)
+                                if not ok_exp:
+                                    log_event({"event": "reject", "token": addr, "symbol": sym, "reason": exp_reason})
+                                    print(f"[reject] {sym} {exp_reason}", flush=True)
+                                    continue
+                                res = buy(cfg, tok["address"], sym, buy_eth=next_size)
+                                if res.get("order_status") == "failed":
+                                    log_event({"event": "buy_failed", **{k: v for k, v in res.items() if k != "result"}})
+                                    print(f"[buy_failed] {sym} order_status=failed", flush=True)
+                                    continue
+                                entry_liq = snap.get("liquidity") or fnum(tok.get("liquidity"))
+                                log_event({
+                                    "event": "buy",
+                                    **{k: v for k, v in res.items() if k != "result"},
+                                    "entry_liq": entry_liq,
+                                    "mc": snap.get("mc"),
+                                    "mode": snap.get("entry_mode"),
+                                    "why": snap.get("entry_why"),
+                                    "lp": snap.get("launchpad") or tok.get("_lp"),
+                                })
+                                if cfg.live or cfg.paper_positions:
+                                    st.setdefault("positions", {})[addr] = {
+                                        "symbol": sym,
+                                        "ts": int(time.time()),
+                                        "buy_eth": next_size,
+                                        "entry_liq": entry_liq,
+                                        "entry_mc": snap.get("mc"),
+                                        "entry_mode": snap.get("entry_mode"),
+                                        "lp": snap.get("launchpad") or tok.get("_lp"),
+                                        "mode": res.get("mode"),
+                                        "order_id": res.get("order_id"),
+                                        "strategy_order_id": res.get("strategy_order_id"),
+                                        "strategy_ok": res.get("strategy_ok"),
+                                        "order_status": res.get("order_status"),
+                                        "creator_address": snap.get("creator_address"),
+                                        "creator_token_balance": snap.get("creator_token_balance"),
+                                        "creator_token_status": snap.get("creator_token_status"),
+                                    }
+                                st["buys_today"] = int(st.get("buys_today") or 0) + 1
+                                print(
+                                    f"[buy] {res.get('mode')} {sym} mc=${snap.get('mc', 0):.0f} liq={entry_liq:.0f} "
+                                    f"order={res.get('order_status')} strategy_ok={res.get('strategy_ok')}",
+                                    flush=True,
+                                )
+                                break
+                            except RateLimitError as e:
+                                rate_limit_until = time.time() + e.sleep_s
+                                log_event({"event": "rate_limit", "sleep_s": e.sleep_s, "where": "buy"})
+                                break
+                            except Exception as e:
+                                log_event({"event": "buy_error", "token": addr, "symbol": sym, "error": str(e)[:300]})
+                                print(f"[buy_err] {sym}: {e}", flush=True)
+                                break
+                    finally:
+                        save_state(st)
+
             if cfg.once:
                 break
             time.sleep(max(0.0, cfg.poll_sec - (time.time() - t0)))
-            continue
-
-        # Off-hours: rest (no new entries). Optionally slow mon-only mode.
-        if not active and not cfg.once:
-            if open_n:
-                # keep monitoring with short-ish sleep so SL/LP exits remain timely
-                sleep_s = min(cfg.poll_sec * 2, 15.0)
-                if tick % 10 == 1:
-                    print(f"[rest] {sess_label} open={open_n} mon-only sleep={sleep_s}s", flush=True)
-                time.sleep(max(0.0, sleep_s - (time.time() - t0)))
-                continue
-            mode = (cfg.offhours_mode or "sleep").lower()
-            if mode == "off":
-                if tick % 5 == 1:
-                    print(f"[rest] {sess_label} bot idle (off)", flush=True)
-                time.sleep(max(30.0, cfg.offhours_poll_sec) - (time.time() - t0) if False else max(30.0, float(cfg.offhours_poll_sec)))
-                continue
-            # sleep: long idle until next check
-            sleep_s = max(30.0, float(cfg.offhours_poll_sec))
-            if tick % 3 == 1:
-                print(f"[rest] {sess_label} no new entries, sleep={sleep_s:.0f}s", flush=True)
-            time.sleep(max(0.0, sleep_s - (time.time() - t0)))
-            continue
-
-        if open_n < cfg.max_positions:
-            try:
-                cands = fetch_candidates(cfg)
-            except Exception as e:
-                print(f"[err] trenches: {e}", flush=True)
-                cands = []
-            print(f"[scan] tick={tick} cands={len(cands)} open={open_n} buys_today={st.get('buys_today', 0)} gate={'Y' if tick % max(cfg.gate_every, 1) == 0 or cfg.once else 'N'}", flush=True)
-            if cands and (tick % max(cfg.gate_every, 1) == 0 or cfg.once):
-                checked = 0
-                try:
-                    for t in cands:
-                        if checked >= cfg.max_gates_per_tick:
-                            break
-                        addr = t["address"].lower()
-                        if addr in st["seen"] or addr in (st.get("positions") or {}):
-                            continue
-                        sym = t.get("symbol") or "?"
-                        checked += 1
-                        ok, reason, snap = pre_entry_gate(cfg, t)
-                        st["seen"][addr] = int(time.time())
-                        if not ok:
-                            log_event({"event": "reject", "token": addr, "symbol": sym, "reason": reason, "mc": snap.get("mc"), "liq": snap.get("liquidity"), "age": snap.get("age"), "lp": snap.get("launchpad") or t.get("_lp")})
-                            print(f"[reject] {sym} {reason} mc={snap.get('mc', 0):.0f} liq={snap.get('liquidity', 0):.0f}", flush=True)
-                            continue
-                        print(f"[signal] {sym} mode={snap.get('entry_mode')} mc=${snap.get('mc', 0):.0f} liq={snap.get('liquidity', 0):.0f} buy={snap.get('buy_eth', cfg.buy_eth)} age={snap.get('age')} {snap.get('entry_why')} {addr[:12]}…", flush=True)
-                        try:
-                            if cfg.probe_eth > 0:
-                                pok, preason, pmeta = probe_trade(cfg, t["address"], sym)
-                                log_event({"event": "probe", "ok": pok, "reason": preason, "symbol": sym, "token": addr, "probe_eth": pmeta.get("probe_eth"), "mode": pmeta.get("mode")})
-                                if not pok:
-                                    print(f"[probe_fail] {sym} {preason}", flush=True)
-                                    continue
-                                print(f"[probe_ok] {sym} {preason}", flush=True)
-                            next_size = float(snap.get("buy_eth") or resolve_buy_eth(cfg))
-                            ok_exp, exp_reason = exposure_ok(cfg, st, next_size)
-                            if not ok_exp:
-                                log_event({"event": "reject", "token": addr, "symbol": sym, "reason": exp_reason})
-                                print(f"[reject] {sym} {exp_reason}", flush=True)
-                                continue
-                            res = buy(cfg, t["address"], sym, buy_eth=next_size)
-                            entry_liq = snap.get("liquidity") or fnum(t.get("liquidity"))
-                            log_event({"event": "buy", **res, "entry_liq": entry_liq, "mc": snap.get("mc"), "mode": snap.get("entry_mode"), "why": snap.get("entry_why"), "lp": snap.get("launchpad") or t.get("_lp")})
-                            if cfg.live or cfg.paper_positions:
-                                st.setdefault("positions", {})[addr] = {
-                                    "symbol": sym,
-                                    "ts": int(time.time()),
-                                    "buy_eth": snap.get("buy_eth") or cfg.buy_eth,
-                                    "entry_liq": entry_liq,
-                                    "entry_mc": snap.get("mc"),
-                                    "entry_mode": snap.get("entry_mode"),
-                                    "lp": snap.get("launchpad") or t.get("_lp"),
-                                    "mode": res.get("mode"),
-                                    "creator_address": snap.get("creator_address"),
-                                    "creator_token_balance": snap.get("creator_token_balance"),
-                                    "creator_token_status": snap.get("creator_token_status"),
-                                }
-                            st["buys_today"] = int(st.get("buys_today") or 0) + 1
-                            print(f"[buy] {res.get('mode')} {sym} mc=${snap.get('mc', 0):.0f} liq={entry_liq:.0f}", flush=True)
-                            break
-                        except Exception as e:
-                            log_event({"event": "buy_error", "token": addr, "symbol": sym, "error": str(e)[:300]})
-                            print(f"[buy_err] {sym}: {e}", flush=True)
-                            break
-                finally:
-                    save_state(st)
-
-        if cfg.once:
-            break
-        time.sleep(max(0.0, cfg.poll_sec - (time.time() - t0)))
+        except RateLimitError as e:
+            rate_limit_until = time.time() + e.sleep_s
+            log_event({"event": "rate_limit", "sleep_s": e.sleep_s, "where": "loop"})
+            time.sleep(e.sleep_s)
+        except Exception as e:
+            print(f"[loop_err] {e}", flush=True)
+            time.sleep(max(1.0, cfg.poll_sec))
 
 
 def apply_profile(cfg: Config, name: str, buy_eth_cli: float) -> None:
@@ -911,6 +1163,7 @@ def apply_profile(cfg: Config, name: str, buy_eth_cli: float) -> None:
         cfg.default_risk_pct = 1.25
 
 
+
 def build_config(
     *,
     wallet: str | None = None,
@@ -934,6 +1187,7 @@ def build_config(
     allow_uniswap: bool = False,
     live: bool = False,
     once: bool = False,
+    paper_positions: bool | None = None,
     require_sell_quote: bool = True,
     probe_eth: float = 0.0,
     risk_pct: float = 0.0,
@@ -955,6 +1209,7 @@ def build_config(
     offhours_mode: str = "sleep",
     offhours_poll_sec: float = 60.0,
     timezone_offset_hours: int = 8,
+    confirm_orders: bool = True,
 ) -> Config:
     cfg = Config(
         wallet=wallet or os.environ.get("GMGN_WALLET", "0x37e9f4a84693bce7f7729612ee91a94c91eef898"),
@@ -971,6 +1226,7 @@ def build_config(
         only_safe_lp=not allow_uniswap,
         live=live,
         once=once,
+        paper_positions=False if paper_positions is None else paper_positions,
         require_sell_quote=require_sell_quote,
         probe_eth=probe_eth,
         risk_pct=risk_pct,
@@ -987,6 +1243,7 @@ def build_config(
         offhours_mode=offhours_mode,
         offhours_poll_sec=offhours_poll_sec,
         timezone_offset_hours=timezone_offset_hours,
+        confirm_orders=confirm_orders,
     )
     apply_profile(cfg, profile, buy_eth)
     if exit_mode:
@@ -999,6 +1256,8 @@ def build_config(
         cfg.trail_drawdown_pct = trail_drawdown_pct
     if use_default_risk is not None:
         cfg.use_default_risk = use_default_risk
+    if paper_positions is not None:
+        cfg.paper_positions = paper_positions
     if min_mc is not None:
         cfg.min_mc = min_mc
     if max_mc is not None:
@@ -1020,6 +1279,7 @@ def run_bot(cfg: Config) -> None:
     except Exception as e:
         print(f"[config_error] active_hours_cn: {e}", flush=True)
         return
+    configure_runtime(cfg)
     if cfg.live:
         print("WARNING: --live spends real funds", flush=True)
         ok, reason = live_preflight(cfg)
@@ -1033,7 +1293,8 @@ def run_bot(cfg: Config) -> None:
     print(
         f"[size] buy_eth={size:.6f} risk_pct={cfg.risk_pct or (cfg.default_risk_pct if cfg.use_default_risk else 0)} "
         f"bankroll≈{br:.4f} max_open_exposure={cfg.max_open_exposure_pct}% "
-        f"probe_eth={cfg.probe_eth} sell_quote={cfg.require_sell_quote} anti_mev={cfg.anti_mev}",
+        f"probe_eth={cfg.probe_eth} sell_quote={cfg.require_sell_quote} anti_mev={cfg.anti_mev} "
+        f"confirm_orders={cfg.confirm_orders}",
         flush=True,
     )
     try:
@@ -1044,43 +1305,56 @@ def run_bot(cfg: Config) -> None:
 
 def compute_stats(log_path: Path | None = None) -> dict:
     path = log_path or LOG_PATH
-    if not path.exists():
-        return {"events": 0}
+    # also scan both dry/live if default
+    paths = [path]
+    for extra in (Path("trades.dry.jsonl"), Path("trades.live.jsonl"), Path("trades.jsonl")):
+        if extra.exists() and extra not in paths:
+            paths.append(extra)
     counts: dict[str, int] = {}
     rejects: dict[str, int] = {}
-    buys = probes_ok = probes_fail = rug_exits = 0
-    for line in path.read_text().splitlines():
-        try:
-            o = json.loads(line)
-        except json.JSONDecodeError:
+    buys = probes_ok = probes_fail = rug_exits = rate_limits = buy_failed = 0
+    used = None
+    for path in paths:
+        if not path.exists():
             continue
-        ev = o.get("event") or ("buy" if o.get("mode") and "buy_eth" in o else "unknown")
-        # normalize
-        if "event" not in o and o.get("mode") in ("dry-run", "live") and "buy_eth" in o:
-            ev = "buy"
-        if o.get("event") == "emergency_sell":
-            ev = "emergency_sell"
-        counts[ev] = counts.get(ev, 0) + 1
-        if ev == "reject":
-            r = str(o.get("reason") or "?")
-            key = r.split(":")[0].split(" ")[0]
-            rejects[key] = rejects.get(key, 0) + 1
-        elif ev == "buy":
-            buys += 1
-        elif ev == "probe":
-            if o.get("ok"):
-                probes_ok += 1
-            else:
-                probes_fail += 1
-        elif ev == "emergency_sell":
-            rug_exits += 1
+        used = path
+        for line in path.read_text().splitlines():
+            try:
+                o = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            ev = o.get("event") or "unknown"
+            if "event" not in o and o.get("mode") in ("dry-run", "live") and "buy_eth" in o:
+                ev = "buy"
+            counts[ev] = counts.get(ev, 0) + 1
+            if ev == "reject":
+                r = str(o.get("reason") or "?")
+                key = r.split(":")[0].split(" ")[0]
+                rejects[key] = rejects.get(key, 0) + 1
+            elif ev == "buy":
+                buys += 1
+            elif ev == "buy_failed":
+                buy_failed += 1
+            elif ev == "probe":
+                if o.get("ok"):
+                    probes_ok += 1
+                else:
+                    probes_fail += 1
+            elif ev == "emergency_sell":
+                rug_exits += 1
+            elif ev == "rate_limit":
+                rate_limits += 1
+    if used is None:
+        return {"events": 0}
     return {
         "events": sum(counts.values()),
         "counts": counts,
         "buys": buys,
+        "buy_failed": buy_failed,
         "probes_ok": probes_ok,
         "probes_fail": probes_fail,
         "emergency_sells": rug_exits,
+        "rate_limits": rate_limits,
         "reject_reasons": dict(sorted(rejects.items(), key=lambda x: -x[1])[:15]),
-        "log": str(path),
+        "log": str(used),
     }

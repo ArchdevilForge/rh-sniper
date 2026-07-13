@@ -19,6 +19,8 @@ safe_lp + mc_in_range + min_liq + (fresh OR reheat)
 
 Default mode is **dry-run** (quotes only). Real money requires explicit `--live`.
 
+**v0.4 live hardening:** order confirmation polling, 429 backoff, dry/live state isolation (`state.dry.json` / `state.live.json`), optional PnL refresh, missing-strategy local exit.
+
 > ⚠️ Meme trading can and will lose money. LP pulls, honeypots, lag, and rate limits are normal failure modes. This is research / automation tooling, not financial advice.
 
 ---
@@ -298,17 +300,36 @@ Built with **Typer** for subcommand management:
 --lp-drop-pct 35 --min-liq-hold 800 --max-hold-sec
 --max-positions 3 --daily-loss-usd 100
 --allow-uniswap --live --once
+--active-hours-cn 18-4   # default: CN 18:00–04:00 only
+--offhours-mode sleep    # rest off-hours (still monitors open positions)
+--offhours-poll 60
+--tz-offset 8
+```
+
+### Session (recommended)
+
+Default **`--active-hours-cn 18-4`** = China time **18:00 → next day 04:00** (主力时间).
+Outside the window: **no new entries**, long sleep; **open positions still monitored** for LP/SL exits.
+
+```bash
+# only main night session
+rh-sniper run -p adff --active-hours-cn 18-4
+
+# 24h (disable session filter)
+rh-sniper run -p adff --active-hours-cn all
+
+# custom multi windows
+rh-sniper run -p 7a23 --active-hours-cn 18-4,8-12
 ```
 
 ### Example: your researched stack
 
 ```bash
-# principal-out + 55% hard SL + 1% risk + probe
-rh-sniper run -p 417c --use-default-risk --probe-eth 0.001 \
-  --hard-sl 55 --tp-ladder 100:55,200:25,400:10 --trail-dd 15
+# HF night session + probe
+rh-sniper run -p 7a23 --active-hours-cn 18-4 --probe-eth 0.001
 
-# pure principal on micro-cap profile
-rh-sniper run -p adff --exit-mode principal --risk-pct 1 --max-buy-eth 0.03
+# larger size runners overnight window
+rh-sniper run -p 417c --active-hours-cn 18-4 --use-default-risk
 ```
 
 ---
