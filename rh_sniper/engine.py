@@ -192,12 +192,18 @@ def bankroll_eth(cfg: Config) -> float:
 
 
 def resolve_buy_eth(cfg: Config) -> float:
-    """Fixed buy_eth, or risk_pct of bankroll (native or --bankroll-eth)."""
+    """Fixed buy_eth, or risk_pct of bankroll (native or --bankroll-eth).
+
+    If risk mode is on but bankroll is 0 (empty wallet / dry-run), fall back to buy_eth
+    so dry-runs still size correctly.
+    """
     risk = cfg.risk_pct
     if (not risk or risk <= 0) and cfg.use_default_risk and cfg.default_risk_pct > 0:
         risk = cfg.default_risk_pct
     if risk and risk > 0:
         bal = bankroll_eth(cfg)
+        if bal <= 0:
+            return max(cfg.buy_eth, 0.0)
         pct = risk / 100.0 if risk >= 1 else risk
         size = bal * pct
         cap = cfg.max_buy_eth if cfg.max_buy_eth > 0 else (cfg.buy_eth if cfg.buy_eth > 0 else size)
