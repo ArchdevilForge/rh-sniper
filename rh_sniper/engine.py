@@ -170,6 +170,7 @@ def load_state() -> dict:
         "positions": {},
         "day": time.strftime("%Y-%m-%d"),
         "day_realized_est": 0.0,
+        "paper_realized_est": 0.0,
         "buys_today": 0,
         "session_start_realized": None,
     }
@@ -407,6 +408,21 @@ def activity_1h(info: dict | None, token_row: dict) -> tuple[float, int]:
     return vol, swaps
 
 
+def _explicit_unsellable(sec: dict, chain: str) -> bool:
+    """GMGN RH often returns can_sell=0 before scan; trust sell quote there, not this flag."""
+    if sec.get("can_not_sell") in (True, 1, "1", "yes", "YES"):
+        return True
+    cs = sec.get("can_sell")
+    # ponytail: never use `cs in (False, ...)` — 0 == False in Python
+    if cs is False or (isinstance(cs, str) and cs.lower() in ("false", "no")):
+        return True
+    if (chain or "").lower() == "robinhood" and cs in (0, "0", None):
+        return False
+    if cs in (0, "0"):
+        return True
+    return False
+
+
 def fake_heat_reject(cfg: Config, snap: dict) -> str | None:
     if not cfg.enable_fake_heat:
         return None
@@ -454,11 +470,8 @@ def token_snapshot(cfg: Config, address: str, token_row: dict | None = None, wit
     pool = (info or {}).get("pool") or {}
     if not liq:
         liq = fnum(pool.get("liquidity") or token_row.get("liquidity"))
-    can_sell = sec.get("can_sell")
-    sellable = can_sell in (True, 1, "1", "yes", "YES", None)
     honeypot = sec.get("is_honeypot") in (True, 1, "1", "yes", "YES") or sec.get("honeypot") in (True, 1, "1", "yes")
-    if sec.get("can_not_sell") in (True, 1, "1", "yes"):
-        sellable = False
+    sellable = not _explicit_unsellable(sec, cfg.chain)
     if honeypot:
         sellable = False
     top10 = fnum(sec.get("top_10_holder_rate"))
@@ -548,7 +561,7 @@ def pre_entry_gate(cfg: Config, token: dict) -> tuple[bool, str, dict]:
         return False, f"unsafe_lp_live:{lp or 'unknown'}", snap
     if snap["honeypot"]:
         return False, "honeypot", snap
-    if cfg.require_can_sell and snap["raw_sec"].get("can_sell") in (False, 0, "0", "no"):
+    if cfg.require_can_sell and _explicit_unsellable(snap["raw_sec"], cfg.chain):
         return False, "can_sell=false", snap
     if snap["liquidity"] < cfg.min_liquidity:
         return False, f"low_liq:{snap['liquidity']:.0f}", snap
@@ -690,6 +703,60 @@ def buy(cfg: Config, token: str, symbol: str, buy_eth: float | None = None) -> d
     return out
 
 
+def _paper_price_exit(cfg: Config, meta: dict, snap: dict) -> str | None:
+    """Dry-run paper: simulate condition-order TP/SL from live price."""
+    entry_px = fnum(meta.get("entry_price"))
+    px = fnum(snap.get("price"))
+    if entry_px <= 0 or px <= 0:
+        return None
+    chg = (px - entry_px) / entry_px * 100.0
+    sl = fnum(cfg.hard_sl_pct or cfg.sl)
+    if chg <= -sl:
+        return f"hard_sl_{chg:.1f}pct"
+    for scale, ratio, tag in (
+        (cfg.tp1, cfg.tp1_pct, "tp1"),
+        (cfg.tp2, cfg.tp2_pct, "tp2"),
+        (cfg.tp3, cfg.tp3_pct, "tp3"),
+    ):
+        if ratio > 0 and chg >= scale:
+            return f"{tag}_{chg:.1f}pct"
+    return None
+
+
+def _paper_close_position(
+    cfg: Config, addr: str, meta: dict, sym: str, reason: str, snap: dict, st: dict,
+) -> dict:
+    """Quote sell and estimate PnL in native for paper dry-run."""
+    buy_eth = fnum(meta.get("buy_eth"))
+    tok_amt = str(meta.get("quote_out") or "0")
+    out_eth = 0.0
+    if tok_amt not in ("0", "", "None"):
+        try:
+            sq = quote(cfg, addr, NATIVE, tok_amt, cfg.slippage)
+            out_eth = int(sq.get("output_amount") or 0) / 1e18
+        except Exception:
+            out_eth = 0.0
+    pnl = out_eth - buy_eth if out_eth > 0 else -buy_eth
+    entry_px = fnum(meta.get("entry_price"))
+    px = fnum(snap.get("price"))
+    chg = ((px - entry_px) / entry_px * 100.0) if entry_px > 0 and px > 0 else None
+    st["paper_realized_est"] = fnum(st.get("paper_realized_est")) + pnl
+    res = {
+        "mode": "dry-run",
+        "event": "paper_exit",
+        "symbol": sym,
+        "token": addr,
+        "reason": reason,
+        "buy_eth": buy_eth,
+        "out_eth_est": out_eth,
+        "pnl_eth_est": pnl,
+        "chg_pct": chg,
+        "paper_total_est": st["paper_realized_est"],
+    }
+    log_event(res)
+    return res
+
+
 def emergency_sell(cfg: Config, token: str, symbol: str, reason: str) -> dict:
     if not cfg.live:
         return {"mode": "dry-run", "event": "emergency_sell", "symbol": symbol, "token": token, "reason": reason}
@@ -765,8 +832,8 @@ def monitor_positions(cfg: Config, st: dict, with_security: bool = False) -> Non
         return
     dead = []
     for addr, meta in list(pos.items()):
-        # skip pure dry paper markers if any leaked
-        if meta.get("mode") == "dry-run" and not cfg.live:
+        is_paper = (meta.get("mode") == "dry-run" and not cfg.live)
+        if is_paper and not cfg.paper_positions:
             continue
         sym = meta.get("symbol") or "?"
         entry_liq = fnum(meta.get("entry_liq"))
@@ -780,7 +847,9 @@ def monitor_positions(cfg: Config, st: dict, with_security: bool = False) -> Non
         liq = snap["liquidity"]
         drop = ((entry_liq - liq) / entry_liq * 100.0) if entry_liq > 0 else 0.0
         reason = None
-        if with_security and (snap["honeypot"] or snap["raw_sec"].get("can_sell") in (False, 0, "0", "no")):
+        if is_paper:
+            reason = _paper_price_exit(cfg, meta, snap)
+        if with_security and (snap["honeypot"] or _explicit_unsellable(snap["raw_sec"], cfg.chain)):
             reason = "unsellable_or_honeypot"
         elif entry_liq > 0 and drop >= cfg.lp_drop_pct:
             reason = f"lp_drop_{drop:.0f}pct"
@@ -802,7 +871,8 @@ def monitor_positions(cfg: Config, st: dict, with_security: bool = False) -> Non
             reason = reason or f"creator_dump {entry_cbal:.0f}->{cbal:.0f}"
         print(
             f"[mon] {sym} held={held}s liq={liq:.0f} entry={entry_liq:.0f} drop={drop:.1f}% "
-            f"sec={int(with_security)} can_sell={snap['can_sell']}",
+            f"sec={int(with_security)} can_sell={snap['can_sell']}"
+            + (f" chg={meta.get('last_chg_pct', 0):+.1f}%" if is_paper and meta.get("last_chg_pct") is not None else ""),
             flush=True,
         )
         if not reason:
@@ -811,12 +881,23 @@ def monitor_positions(cfg: Config, st: dict, with_security: bool = False) -> Non
             if with_security:
                 meta["creator_token_balance"] = cbal
                 meta["creator_token_status"] = snap.get("creator_token_status")
+            entry_px = fnum(meta.get("entry_price"))
+            px = fnum(snap.get("price"))
+            if is_paper and entry_px > 0 and px > 0:
+                meta["last_chg_pct"] = (px - entry_px) / entry_px * 100.0
             continue
         print(f"[RUG_EXIT] {sym} reason={reason}", flush=True)
         try:
-            res = emergency_sell(cfg, addr, sym, reason)
-            log_event({**res, "entry_liq": entry_liq, "liq": liq, "drop_pct": drop, "held": held})
-            # crude pnl: if live sell, mark day est change unknown; rely on refresh
+            if is_paper:
+                res = _paper_close_position(cfg, addr, meta, sym, reason, snap, st)
+                print(
+                    f"[paper_exit] {sym} {reason} pnl≈{res.get('pnl_eth_est', 0):+.6f} ETH "
+                    f"total≈{st.get('paper_realized_est', 0):+.6f} ETH",
+                    flush=True,
+                )
+            else:
+                res = emergency_sell(cfg, addr, sym, reason)
+                log_event({**res, "entry_liq": entry_liq, "liq": liq, "drop_pct": drop, "held": held})
             dead.append(addr)
         except Exception as e:
             log_event({"event": "emergency_sell_error", "token": addr, "symbol": sym, "error": str(e)[:300]})
@@ -1053,6 +1134,8 @@ def loop(cfg: Config) -> None:
                                         "buy_eth": next_size,
                                         "entry_liq": entry_liq,
                                         "entry_mc": snap.get("mc"),
+                                        "entry_price": snap.get("price"),
+                                        "quote_out": res.get("quote_out"),
                                         "entry_mode": snap.get("entry_mode"),
                                         "lp": snap.get("launchpad") or tok.get("_lp"),
                                         "mode": res.get("mode"),
