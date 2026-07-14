@@ -161,7 +161,8 @@ def status_cmd() -> None:
     seen = st.get("seen") or {}
     typer.echo(f"state: {STATE_PATH}")
     typer.echo(
-        f"day: {st.get('day')}  buys_today: {st.get('buys_today', 0)}  day_pnl_est: {st.get('day_realized_est', 0)}"
+        f"day: {st.get('day')}  buys_today: {st.get('buys_today', 0)}  "
+        f"day_pnl_est: {st.get('day_realized_est', 0)}  paper_pnl_est: {st.get('paper_realized_est', 0):+.6f} ETH"
     )
     typer.echo(f"seen_tokens: {len(seen)}  open_positions: {len(pos)}")
     for addr, meta in pos.items():
