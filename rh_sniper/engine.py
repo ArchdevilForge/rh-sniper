@@ -90,8 +90,14 @@ class Config:
     reheat_min_swaps_1h: int = 30
     min_mc: float = 3000.0
     max_mc: float = 15000.0
+    bankr_max_mc: float = 35000.0  # bankr often prints >15k on open
     min_liquidity: float = 1500.0
     max_top10: float = 0.40
+    max_top10_fresh: float = 0.70  # first-wave concentration is normal
+    fresh_top10_age_sec: int = 45
+    allow_unindexed_liq: bool = True  # liq==0 + fresh → trust buy quote
+    soft_retry_sec: int = 5
+    disable_reheat: bool = False  # adff first-wave only
     max_rug: float = 0.25
     min_holders: int = 5
     max_positions: int = 3
@@ -532,6 +538,41 @@ def token_snapshot(cfg: Config, address: str, token_row: dict | None = None, wit
     }
 
 
+def mc_range_for_lp(cfg: Config, lp: str) -> tuple[float, float]:
+    """LP-aware MC window. bankr often opens above virtuals band."""
+    lo, hi = float(cfg.min_mc), float(cfg.max_mc)
+    if "bankr" in (lp or "").lower() and cfg.bankr_max_mc > hi:
+        hi = float(cfg.bankr_max_mc)
+    return lo, hi
+
+
+def effective_max_top10(cfg: Config, age: int | float | None) -> float:
+    """Loosen holder concentration for true first-wave prints."""
+    base = float(cfg.max_top10 or 0)
+    if base <= 0:
+        return 0.0
+    if age is not None and age <= cfg.fresh_top10_age_sec:
+        return max(base, float(cfg.max_top10_fresh or base))
+    return base
+
+
+def should_defer_unindexed_liq(cfg: Config, liq: float, age: int | float | None) -> bool:
+    """liq==0 is often GMGN index lag, not empty pool — prove via quote."""
+    return bool(
+        cfg.allow_unindexed_liq
+        and liq <= 0
+        and age is not None
+        and age <= cfg.fresh_max_age_sec
+    )
+
+
+def soft_retry_wait(cfg: Config, age: int | float | None = None) -> int:
+    base = max(1, int(cfg.soft_retry_sec or 5))
+    if age is not None and age <= 60:
+        return min(base, 3)
+    return base
+
+
 def classify_entry(cfg: Config, snap: dict) -> tuple[str | None, str]:
     age = snap.get("age")
     create_age = snap.get("create_age")
@@ -541,6 +582,8 @@ def classify_entry(cfg: Config, snap: dict) -> tuple[str | None, str]:
         return "fresh", f"age={fresh_age}s"
     if open_age is None and create_age is not None and create_age <= cfg.fresh_max_age_sec * 2:
         return "fresh", f"preopen_create_age={create_age}s"
+    if cfg.disable_reheat or cfg.reheat_max_age_sec <= 0:
+        return None, f"stale age={age} (reheat off) vol1h={snap.get('vol_1h')} swaps1h={snap.get('swaps_1h')}"
     if age is not None and age <= cfg.reheat_max_age_sec:
         if snap["vol_1h"] >= cfg.reheat_min_vol_1h or snap["swaps_1h"] >= cfg.reheat_min_swaps_1h:
             return "reheat", f"age={age}s vol1h={snap['vol_1h']:.0f} swaps1h={snap['swaps_1h']}"
@@ -555,8 +598,10 @@ SOFT_REJECT_PREFIXES = (
     "timing:",
     "buy_quote_zero_out",
     "no_sell_route:",
+    "no_buy_route:",
+    "top10_pending:",
 )
-SOFT_RETRY_SEC = 15
+SOFT_RETRY_SEC = 5  # legacy default; prefer cfg.soft_retry_sec
 
 
 def is_soft_reject(reason: str) -> bool:
@@ -571,26 +616,38 @@ def pre_entry_gate(cfg: Config, token: dict) -> tuple[bool, str, dict]:
     lp = (token.get("_lp") or token.get("launchpad") or token.get("launchpad_platform") or "").lower()
     if cfg.only_safe_lp and not any(x in lp for x in SAFE_LP):
         return False, f"unsafe_lp:{lp or 'unknown'}", {}
+    mc_lo, mc_hi = mc_range_for_lp(cfg, lp)
     mc0 = fnum(token.get("usd_market_cap") or token.get("market_cap"))
-    if mc0 > 0 and (mc0 < cfg.min_mc * 0.5 or mc0 > cfg.max_mc * 2):
+    if mc0 > 0 and (mc0 < mc_lo * 0.5 or mc0 > mc_hi * 2):
         return False, f"mc_trench_out:{mc0:.0f}", {}
     try:
         snap = token_snapshot(cfg, addr, token)
     except Exception as e:
         return False, f"snapshot_fail:{e}", {}
     lp = snap["launchpad"] or lp
+    mc_lo, mc_hi = mc_range_for_lp(cfg, lp)
     if cfg.only_safe_lp and not any(x in lp for x in SAFE_LP):
         return False, f"unsafe_lp_live:{lp or 'unknown'}", snap
     if snap["honeypot"]:
         return False, "honeypot", snap
     if cfg.require_can_sell and _explicit_unsellable(snap["raw_sec"], cfg.chain):
         return False, "can_sell=false", snap
-    if snap["liquidity"] < cfg.min_liquidity:
-        return False, f"low_liq:{snap['liquidity']:.0f}", snap
+    age = snap.get("age")
+    liq = fnum(snap.get("liquidity"))
+    if liq < cfg.min_liquidity:
+        if should_defer_unindexed_liq(cfg, liq, age):
+            snap["liq_deferred"] = True  # prove route via quote below
+        else:
+            return False, f"low_liq:{liq:.0f}", snap
     if snap["sell_tax"] > 10 or snap["buy_tax"] > 10:
         return False, f"tax:{snap['buy_tax']}/{snap['sell_tax']}", snap
-    if snap["top10"] > cfg.max_top10 > 0:
-        return False, f"top10:{snap['top10']}", snap
+    top10_lim = effective_max_top10(cfg, age)
+    top10 = fnum(snap.get("top10"))
+    if top10_lim > 0 and top10 > top10_lim:
+        # 1.0 with tiny age is usually incomplete holder index, not a finished rug print
+        if top10 >= 0.99 and age is not None and age <= 30:
+            return False, f"top10_pending:{top10}", snap
+        return False, f"top10:{top10}", snap
     fh = fake_heat_reject(cfg, snap)
     if fh:
         return False, f"fake_heat:{fh}", snap
@@ -600,8 +657,8 @@ def pre_entry_gate(cfg: Config, token: dict) -> tuple[bool, str, dict]:
     mc = snap["mc"]
     if mc <= 0:
         return False, "mc_unknown", snap
-    if mc < cfg.min_mc or mc > cfg.max_mc:
-        return False, f"mc_out:{mc:.0f} not_in[{cfg.min_mc:.0f},{cfg.max_mc:.0f}]", snap
+    if mc < mc_lo or mc > mc_hi:
+        return False, f"mc_out:{mc:.0f} not_in[{mc_lo:.0f},{mc_hi:.0f}]", snap
     mode, why = classify_entry(cfg, snap)
     if not mode:
         return False, f"timing:{why}", snap
@@ -617,10 +674,10 @@ def pre_entry_gate(cfg: Config, token: dict) -> tuple[bool, str, dict]:
         snap["buy_quote_out"] = bq.get("output_amount")
     except Exception as e:
         return False, f"no_buy_route:{e}", snap
+    out_amt = str(bq.get("output_amount") or "0")
+    if out_amt in ("0", "", "None"):
+        return False, "buy_quote_zero_out", snap
     if cfg.require_sell_quote:
-        out_amt = str(bq.get("output_amount") or "0")
-        if out_amt in ("0", "", "None"):
-            return False, "buy_quote_zero_out", snap
         try:
             sell_amt = str(max(int(int(out_amt) * 0.5), 1))
             quote(cfg, addr, NATIVE, sell_amt, cfg.slippage)
@@ -656,7 +713,7 @@ def fetch_candidates(cfg: Config) -> list[dict]:
             if age is None:
                 continue
             is_fresh = age <= cfg.fresh_max_age_sec or (create_age is not None and create_age <= cfg.fresh_max_age_sec)
-            is_reheat_cand = age <= cfg.reheat_max_age_sec and (
+            is_reheat_cand = (not cfg.disable_reheat) and cfg.reheat_max_age_sec > 0 and age <= cfg.reheat_max_age_sec and (
                 fnum(t.get("volume_1h") or t.get("volume_24h")) >= cfg.reheat_min_vol_1h * 0.25
                 or int(t.get("swaps_1h") or t.get("swaps_24h") or 0) >= max(5, cfg.reheat_min_swaps_1h // 3)
                 or fnum(t.get("liquidity")) >= cfg.min_liquidity
@@ -666,7 +723,8 @@ def fetch_candidates(cfg: Config) -> list[dict]:
             if fnum(t.get("rug_ratio")) > cfg.max_rug:
                 continue
             mc = fnum(t.get("usd_market_cap") or t.get("market_cap"))
-            if mc > 0 and (mc < cfg.min_mc * 0.3 or mc > cfg.max_mc * 3):
+            mc_lo, mc_hi = mc_range_for_lp(cfg, lp)
+            if mc > 0 and (mc < mc_lo * 0.3 or mc > mc_hi * 3):
                 continue
             t["_age"] = age
             t["_cat"] = cat
@@ -1000,7 +1058,9 @@ def loop(cfg: Config) -> None:
     est = 3 + cfg.max_positions + (4 * cfg.max_gates_per_tick) / max(cfg.gate_every, 1)
     print(
         f"[start] profile={cfg.profile} buy={cfg.buy_eth}ETH mc=[{cfg.min_mc:.0f},{cfg.max_mc:.0f}] "
-        f"fresh<={cfg.fresh_max_age_sec}s reheat_vol>={cfg.reheat_min_vol_1h} min_liq={cfg.min_liquidity} live={cfg.live}",
+        f"bankr_mc<={cfg.bankr_max_mc:.0f} fresh<={cfg.fresh_max_age_sec}s reheat={'OFF' if cfg.disable_reheat else cfg.reheat_min_vol_1h} "
+        f"min_liq={cfg.min_liquidity} top10={cfg.max_top10}/{cfg.max_top10_fresh}@{cfg.fresh_top10_age_sec}s "
+        f"unindexed_liq={cfg.allow_unindexed_liq} live={cfg.live}",
         flush=True,
     )
     print(
@@ -1100,7 +1160,8 @@ def loop(cfg: Config) -> None:
                                 continue
                             # soft cooldown only — hard bans live in seen
                             soft_ts = int(soft_seen.get(addr) or 0)
-                            if soft_ts and now_i - soft_ts < SOFT_RETRY_SEC:
+                            age_hint = tok.get("_age")
+                            if soft_ts and now_i - soft_ts < soft_retry_wait(cfg, age_hint):
                                 continue
                             sym = tok.get("symbol") or "?"
                             checked += 1
@@ -1111,7 +1172,14 @@ def loop(cfg: Config) -> None:
                                 log_event({"event": "rate_limit", "sleep_s": e.sleep_s, "where": "gate"})
                                 break
                             if not ok:
-                                if is_soft_reject(reason):
+                                soft = is_soft_reject(reason)
+                                age_now = snap.get("age") if snap else age_hint
+                                # past first-wave window: stop thrashing zero-liq ghosts
+                                if soft and age_now is not None and age_now > cfg.fresh_max_age_sec and str(reason).startswith(
+                                    ("low_liq:", "top10_pending:", "no_buy_route:", "buy_quote_zero_out")
+                                ):
+                                    soft = False
+                                if soft:
                                     soft_seen[addr] = now_i
                                 else:
                                     st["seen"][addr] = now_i
@@ -1120,7 +1188,7 @@ def loop(cfg: Config) -> None:
                                     "event": "reject", "token": addr, "symbol": sym, "reason": reason,
                                     "mc": snap.get("mc"), "liq": snap.get("liquidity"),
                                     "age": snap.get("age"), "lp": snap.get("launchpad") or tok.get("_lp"),
-                                    "soft": is_soft_reject(reason),
+                                    "soft": soft,
                                 })
                                 print(f"[reject] {sym} {reason} mc={snap.get('mc', 0):.0f} liq={snap.get('liquidity', 0):.0f}", flush=True)
                                 continue
@@ -1222,13 +1290,20 @@ def apply_profile(cfg: Config, name: str, buy_eth_cli: float) -> None:
     """Parameter packs from reversed wallets — style, not address mirror."""
     cfg.profile = name
     if name == "adff":
-        # 荒大宝: ~$50, micro MC, ultra short
+        # 荒大宝: ~$50, micro MC, ultra short, FIRST WAVE only
         cfg.buy_eth = 0.03 if buy_eth_cli == 0.03 else buy_eth_cli
         cfg.min_mc, cfg.max_mc = 3000, 15000
-        cfg.fresh_max_age_sec = 600
+        cfg.bankr_max_mc = 35000
+        cfg.fresh_max_age_sec = 120  # was 600 — true first wave, not 10min chase
+        cfg.disable_reheat = True
         cfg.reheat_min_vol_1h = 5000
         cfg.reheat_min_swaps_1h = 20
-        cfg.min_liquidity = 1200
+        cfg.min_liquidity = 800
+        cfg.max_top10 = 0.55
+        cfg.max_top10_fresh = 0.70
+        cfg.fresh_top10_age_sec = 45
+        cfg.allow_unindexed_liq = True
+        cfg.soft_retry_sec = 3
         # HF reverse of 0xadff: fixed small size, first print ~1.1-1.5x often FULL clear
         cfg.exit_mode = "hf_full"
         cfg.tp1, cfg.tp1_pct = 20, 100   # +20% (~1.2x) dump all — matches full-clear peak
@@ -1300,9 +1375,15 @@ def build_config(
     mon_sec_every: int = 3,
     min_mc: float | None = None,
     max_mc: float | None = None,
+    bankr_max_mc: float | None = None,
     min_liq: float | None = None,
+    max_top10: float | None = None,
+    max_top10_fresh: float | None = None,
     fresh_max_age: int | None = None,
     reheat_min_vol: float | None = None,
+    allow_unindexed_liq: bool | None = None,
+    disable_reheat: bool | None = None,
+    soft_retry_sec: int | None = None,
     lp_drop_pct: float = 35.0,
     min_liq_hold: float = 800.0,
     max_hold_sec: int | None = None,
@@ -1386,12 +1467,24 @@ def build_config(
         cfg.min_mc = min_mc
     if max_mc is not None:
         cfg.max_mc = max_mc
+    if bankr_max_mc is not None:
+        cfg.bankr_max_mc = bankr_max_mc
     if min_liq is not None:
         cfg.min_liquidity = min_liq
+    if max_top10 is not None:
+        cfg.max_top10 = max_top10
+    if max_top10_fresh is not None:
+        cfg.max_top10_fresh = max_top10_fresh
     if fresh_max_age is not None:
         cfg.fresh_max_age_sec = fresh_max_age
     if reheat_min_vol is not None:
         cfg.reheat_min_vol_1h = reheat_min_vol
+    if allow_unindexed_liq is not None:
+        cfg.allow_unindexed_liq = allow_unindexed_liq
+    if disable_reheat is not None:
+        cfg.disable_reheat = disable_reheat
+    if soft_retry_sec is not None:
+        cfg.soft_retry_sec = max(1, int(soft_retry_sec))
     if max_hold_sec is not None:
         cfg.max_hold_sec = max_hold_sec
     return cfg
