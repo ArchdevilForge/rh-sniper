@@ -164,9 +164,12 @@ def configure_runtime(cfg: Config) -> None:
 
 def load_state() -> dict:
     if STATE_PATH.exists():
-        return json.loads(STATE_PATH.read_text())
+        st = json.loads(STATE_PATH.read_text())
+        st.setdefault("soft_seen", {})
+        return st
     return {
         "seen": {},
+        "soft_seen": {},
         "positions": {},
         "day": time.strftime("%Y-%m-%d"),
         "day_realized_est": 0.0,
@@ -544,6 +547,25 @@ def classify_entry(cfg: Config, snap: dict) -> tuple[str | None, str]:
     return None, f"stale age={age} vol1h={snap.get('vol_1h')} swaps1h={snap.get('swaps_1h')}"
 
 
+# Soft rejects: first-wave often shows liq=0 before pool indexes. Retry, don't 24h-ban.
+SOFT_REJECT_PREFIXES = (
+    "low_liq:",
+    "mc_unknown",
+    "snapshot_fail:",
+    "timing:",
+    "buy_quote_zero_out",
+    "no_sell_route:",
+)
+SOFT_RETRY_SEC = 15
+
+
+def is_soft_reject(reason: str) -> bool:
+    r = str(reason or "")
+    if r == "mc_unknown":
+        return True
+    return any(r.startswith(p) for p in SOFT_REJECT_PREFIXES)
+
+
 def pre_entry_gate(cfg: Config, token: dict) -> tuple[bool, str, dict]:
     addr = token["address"]
     lp = (token.get("_lp") or token.get("launchpad") or token.get("launchpad_platform") or "").lower()
@@ -909,6 +931,8 @@ def monitor_positions(cfg: Config, st: dict, with_security: bool = False) -> Non
 def prune_seen(st: dict, keep_sec: int = 86400) -> None:
     now = int(time.time())
     st["seen"] = {k: v for k, v in st["seen"].items() if now - int(v) < keep_sec}
+    soft = st.get("soft_seen") or {}
+    st["soft_seen"] = {k: v for k, v in soft.items() if now - int(v) < keep_sec}
 
 
 def rollover_day(st: dict) -> None:
@@ -1066,11 +1090,17 @@ def loop(cfg: Config) -> None:
                 if cands and (tick % max(cfg.gate_every, 1) == 0 or cfg.once):
                     checked = 0
                     try:
+                        soft_seen = st.setdefault("soft_seen", {})
+                        now_i = int(time.time())
                         for tok in cands:
                             if checked >= cfg.max_gates_per_tick:
                                 break
                             addr = tok["address"].lower()
                             if addr in st["seen"] or addr in (st.get("positions") or {}):
+                                continue
+                            # soft cooldown only — hard bans live in seen
+                            soft_ts = int(soft_seen.get(addr) or 0)
+                            if soft_ts and now_i - soft_ts < SOFT_RETRY_SEC:
                                 continue
                             sym = tok.get("symbol") or "?"
                             checked += 1
@@ -1080,15 +1110,23 @@ def loop(cfg: Config) -> None:
                                 rate_limit_until = time.time() + e.sleep_s
                                 log_event({"event": "rate_limit", "sleep_s": e.sleep_s, "where": "gate"})
                                 break
-                            st["seen"][addr] = int(time.time())
                             if not ok:
+                                if is_soft_reject(reason):
+                                    soft_seen[addr] = now_i
+                                else:
+                                    st["seen"][addr] = now_i
+                                    soft_seen.pop(addr, None)
                                 log_event({
                                     "event": "reject", "token": addr, "symbol": sym, "reason": reason,
                                     "mc": snap.get("mc"), "liq": snap.get("liquidity"),
                                     "age": snap.get("age"), "lp": snap.get("launchpad") or tok.get("_lp"),
+                                    "soft": is_soft_reject(reason),
                                 })
                                 print(f"[reject] {sym} {reason} mc={snap.get('mc', 0):.0f} liq={snap.get('liquidity', 0):.0f}", flush=True)
                                 continue
+                            # passed gate — permanent seen (avoid double-buy races)
+                            st["seen"][addr] = now_i
+                            soft_seen.pop(addr, None)
                             print(
                                 f"[signal] {sym} mode={snap.get('entry_mode')} mc=${snap.get('mc', 0):.0f} "
                                 f"liq={snap.get('liquidity', 0):.0f} buy={snap.get('buy_eth', cfg.buy_eth)} "
@@ -1109,7 +1147,10 @@ def loop(cfg: Config) -> None:
                                 next_size = float(snap.get("buy_eth") or resolve_buy_eth(cfg))
                                 ok_exp, exp_reason = exposure_ok(cfg, st, next_size)
                                 if not ok_exp:
-                                    log_event({"event": "reject", "token": addr, "symbol": sym, "reason": exp_reason})
+                                    # portfolio limit, not token quality — allow retry later
+                                    st["seen"].pop(addr, None)
+                                    soft_seen[addr] = int(time.time())
+                                    log_event({"event": "reject", "token": addr, "symbol": sym, "reason": exp_reason, "soft": True})
                                     print(f"[reject] {sym} {exp_reason}", flush=True)
                                     continue
                                 res = buy(cfg, tok["address"], sym, buy_eth=next_size)
