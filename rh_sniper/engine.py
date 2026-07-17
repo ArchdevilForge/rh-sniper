@@ -13,7 +13,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 NATIVE = "0x0000000000000000000000000000000000000000"
-SAFE_LP = ("noxa", "bankr", "trench", "virtuals", "flap")
+# bankr removed: paper100 showed ~-0.17e-3 ETH/trade EV vs virtuals +EV
+SAFE_LP = ("pons", "noxa", "trench", "virtuals", "flap")
 
 # Paths resolved in configure_runtime() after live/dry known
 STATE_PATH = Path(os.environ.get("RH_SNIPER_STATE", "state.json")).expanduser()
@@ -22,6 +23,13 @@ LOG_PATH = Path(os.environ.get("RH_SNIPER_LOG", "trades.jsonl")).expanduser()
 
 class RateLimitError(RuntimeError):
     def __init__(self, message: str, sleep_s: float = 60.0):
+        super().__init__(message)
+        self.sleep_s = sleep_s
+
+
+class AuthError(RuntimeError):
+    """GMGN 401 / auth failure — cool down instead of thrashing quotes."""
+    def __init__(self, message: str, sleep_s: float = 120.0):
         super().__init__(message)
         self.sleep_s = sleep_s
 
@@ -51,6 +59,20 @@ def _parse_rate_limit_sleep(text: str) -> float | None:
     return 60.0
 
 
+def _is_auth_error(text: str) -> bool:
+    if not text:
+        return False
+    low = text.lower()
+    return (
+        "http 401" in low
+        or "code=401" in low
+        or " error=401" in low
+        or "unauthorized" in low
+        or "invalid api" in low
+        or "api key" in low and ("invalid" in low or "expired" in low)
+    )
+
+
 def sh(args: list[str], timeout: int = 60, retries: int = 1) -> dict | list | None:
     last_err = ""
     for attempt in range(max(1, retries + 1)):
@@ -61,6 +83,8 @@ def sh(args: list[str], timeout: int = 60, retries: int = 1) -> dict | list | No
         if p.returncode == 0:
             return json.loads(out) if out else None
         last_err = blob
+        if _is_auth_error(blob):
+            raise AuthError(f"auth failed: {blob[:300]}", sleep_s=120.0)
         sleep_s = _parse_rate_limit_sleep(blob)
         if sleep_s is not None:
             if attempt < retries:
@@ -84,6 +108,7 @@ class Config:
     gate_every: int = 2
     max_gates_per_tick: int = 2
     mon_security_every: int = 3
+    fresh_min_age_sec: int = 0  # skip ultra-fresh snipes; paper: 0-15s was -EV
     fresh_max_age_sec: int = 600
     reheat_max_age_sec: int = 7 * 24 * 3600
     reheat_min_vol_1h: float = 8000.0
@@ -92,6 +117,7 @@ class Config:
     max_mc: float = 15000.0
     bankr_max_mc: float = 35000.0  # bankr often prints >15k on open
     min_liquidity: float = 1500.0
+    allowed_lps: tuple[str, ...] = ()  # empty = SAFE_LP; else intersect
     max_top10: float = 0.40
     max_top10_fresh: float = 0.70  # first-wave concentration is normal
     fresh_top10_age_sec: int = 45
@@ -150,6 +176,7 @@ class Config:
     order_confirm_poll_s: float = 2.0
     pnl_refresh_every: int = 15  # ticks
     local_exit_if_no_strategy: bool = True
+    auth_cooldown_sec: float = 120.0
 
 
 def configure_runtime(cfg: Config) -> None:
@@ -315,6 +342,20 @@ def native_balance_eth(cfg: Config) -> float:
         for b in w.get("balances") or []:
             if (b.get("token_address") or "").lower() in ("", NATIVE.lower()):
                 return fnum(b.get("balance"))
+    # portfolio info may be empty even when wallet is tradeable — fall back to stats
+    if wallet:
+        try:
+            stats = sh([
+                "gmgn-cli", "portfolio", "stats",
+                "--chain", cfg.chain, "--wallet", wallet, "--period", "7d", "--raw",
+            ], retries=0) or {}
+            if isinstance(stats, list) and stats:
+                stats = stats[0]
+            bal = fnum(stats.get("native_balance"))
+            if bal > 0:
+                return bal
+        except Exception:
+            pass
     return 0.0
 
 
@@ -546,6 +587,19 @@ def mc_range_for_lp(cfg: Config, lp: str) -> tuple[float, float]:
     return lo, hi
 
 
+def allowed_lp_names(cfg: Config) -> tuple[str, ...]:
+    if cfg.allowed_lps:
+        return tuple(x.lower() for x in cfg.allowed_lps if x)
+    return SAFE_LP
+
+
+def lp_allowed(cfg: Config, lp: str | None) -> bool:
+    if not cfg.only_safe_lp:
+        return True
+    low = (lp or "").lower()
+    return any(x in low for x in allowed_lp_names(cfg))
+
+
 def effective_max_top10(cfg: Config, age: int | float | None) -> float:
     """Loosen holder concentration for true first-wave prints."""
     base = float(cfg.max_top10 or 0)
@@ -578,9 +632,12 @@ def classify_entry(cfg: Config, snap: dict) -> tuple[str | None, str]:
     create_age = snap.get("create_age")
     open_age = snap.get("open_age")
     fresh_age = open_age if open_age is not None else create_age
-    if fresh_age is not None and fresh_age <= cfg.fresh_max_age_sec:
+    min_age = max(0, int(cfg.fresh_min_age_sec or 0))
+    if fresh_age is not None and fresh_age < min_age:
+        return None, f"too_fresh age={fresh_age}s < {min_age}s"
+    if fresh_age is not None and min_age <= fresh_age <= cfg.fresh_max_age_sec:
         return "fresh", f"age={fresh_age}s"
-    if open_age is None and create_age is not None and create_age <= cfg.fresh_max_age_sec * 2:
+    if open_age is None and create_age is not None and min_age <= create_age <= cfg.fresh_max_age_sec * 2:
         return "fresh", f"preopen_create_age={create_age}s"
     if cfg.disable_reheat or cfg.reheat_max_age_sec <= 0:
         return None, f"stale age={age} (reheat off) vol1h={snap.get('vol_1h')} swaps1h={snap.get('swaps_1h')}"
@@ -600,6 +657,7 @@ SOFT_REJECT_PREFIXES = (
     "no_sell_route:",
     "no_buy_route:",
     "top10_pending:",
+    "auth:",
 )
 SOFT_RETRY_SEC = 5  # legacy default; prefer cfg.soft_retry_sec
 
@@ -614,7 +672,7 @@ def is_soft_reject(reason: str) -> bool:
 def pre_entry_gate(cfg: Config, token: dict) -> tuple[bool, str, dict]:
     addr = token["address"]
     lp = (token.get("_lp") or token.get("launchpad") or token.get("launchpad_platform") or "").lower()
-    if cfg.only_safe_lp and not any(x in lp for x in SAFE_LP):
+    if not lp_allowed(cfg, lp):
         return False, f"unsafe_lp:{lp or 'unknown'}", {}
     mc_lo, mc_hi = mc_range_for_lp(cfg, lp)
     mc0 = fnum(token.get("usd_market_cap") or token.get("market_cap"))
@@ -622,17 +680,22 @@ def pre_entry_gate(cfg: Config, token: dict) -> tuple[bool, str, dict]:
         return False, f"mc_trench_out:{mc0:.0f}", {}
     try:
         snap = token_snapshot(cfg, addr, token)
+    except AuthError:
+        raise
     except Exception as e:
         return False, f"snapshot_fail:{e}", {}
     lp = snap["launchpad"] or lp
     mc_lo, mc_hi = mc_range_for_lp(cfg, lp)
-    if cfg.only_safe_lp and not any(x in lp for x in SAFE_LP):
+    if not lp_allowed(cfg, lp):
         return False, f"unsafe_lp_live:{lp or 'unknown'}", snap
     if snap["honeypot"]:
         return False, "honeypot", snap
     if cfg.require_can_sell and _explicit_unsellable(snap["raw_sec"], cfg.chain):
         return False, "can_sell=false", snap
     age = snap.get("age")
+    min_age = max(0, int(cfg.fresh_min_age_sec or 0))
+    if age is not None and age < min_age:
+        return False, f"timing:too_fresh age={age}s < {min_age}s", snap
     liq = fnum(snap.get("liquidity"))
     if liq < cfg.min_liquidity:
         if should_defer_unindexed_liq(cfg, liq, age):
@@ -656,8 +719,12 @@ def pre_entry_gate(cfg: Config, token: dict) -> tuple[bool, str, dict]:
         return False, cr, snap
     mc = snap["mc"]
     if mc <= 0:
-        return False, "mc_unknown", snap
-    if mc < mc_lo or mc > mc_hi:
+        # first-wave often has mc=0 until GMGN indexes — same trust-as-quote path as liq=0
+        if cfg.allow_unindexed_liq and age is not None and age <= cfg.fresh_max_age_sec:
+            snap["mc_deferred"] = True
+        else:
+            return False, "mc_unknown", snap
+    elif mc < mc_lo or mc > mc_hi:
         return False, f"mc_out:{mc:.0f} not_in[{mc_lo:.0f},{mc_hi:.0f}]", snap
     mode, why = classify_entry(cfg, snap)
     if not mode:
@@ -672,6 +739,8 @@ def pre_entry_gate(cfg: Config, token: dict) -> tuple[bool, str, dict]:
     try:
         bq = quote(cfg, NATIVE, addr, amount, cfg.slippage)
         snap["buy_quote_out"] = bq.get("output_amount")
+    except AuthError:
+        raise
     except Exception as e:
         return False, f"no_buy_route:{e}", snap
     out_amt = str(bq.get("output_amount") or "0")
@@ -681,6 +750,8 @@ def pre_entry_gate(cfg: Config, token: dict) -> tuple[bool, str, dict]:
         try:
             sell_amt = str(max(int(int(out_amt) * 0.5), 1))
             quote(cfg, addr, NATIVE, sell_amt, cfg.slippage)
+        except AuthError:
+            raise
         except Exception as e:
             return False, f"no_sell_route:{e}", snap
     return True, f"ok:{mode}", snap
@@ -703,7 +774,7 @@ def fetch_candidates(cfg: Config) -> list[dict]:
             if not addr.startswith("0x"):
                 continue
             lp = (t.get("launchpad") or t.get("launchpad_platform") or "").lower()
-            if cfg.only_safe_lp and lp and not any(x in lp for x in SAFE_LP):
+            if lp and not lp_allowed(cfg, lp):
                 continue
             created = int(t.get("created_timestamp") or 0)
             opened = int(t.get("open_timestamp") or 0)
@@ -712,7 +783,14 @@ def fetch_candidates(cfg: Config) -> list[dict]:
             age = open_age if open_age is not None else create_age
             if age is None:
                 continue
-            is_fresh = age <= cfg.fresh_max_age_sec or (create_age is not None and create_age <= cfg.fresh_max_age_sec)
+            min_age = max(0, int(cfg.fresh_min_age_sec or 0))
+            # keep slightly-too-fresh candidates so gate can wait; drop ancient noise later
+            if age < max(0, min_age - 15):
+                continue
+            is_fresh = (
+                (min_age <= age <= cfg.fresh_max_age_sec)
+                or (create_age is not None and min_age <= create_age <= cfg.fresh_max_age_sec)
+            )
             is_reheat_cand = (not cfg.disable_reheat) and cfg.reheat_max_age_sec > 0 and age <= cfg.reheat_max_age_sec and (
                 fnum(t.get("volume_1h") or t.get("volume_24h")) >= cfg.reheat_min_vol_1h * 0.25
                 or int(t.get("swaps_1h") or t.get("swaps_24h") or 0) >= max(5, cfg.reheat_min_swaps_1h // 3)
@@ -810,17 +888,36 @@ def _paper_close_position(
     buy_eth = fnum(meta.get("buy_eth"))
     tok_amt = str(meta.get("quote_out") or "0")
     out_eth = 0.0
+    quote_ok = False
+    quote_err = ""
     if tok_amt not in ("0", "", "None"):
         try:
             sq = quote(cfg, addr, NATIVE, tok_amt, cfg.slippage)
             out_eth = int(sq.get("output_amount") or 0) / 1e18
-        except Exception:
+            quote_ok = out_eth > 0
+        except AuthError:
+            raise
+        except Exception as e:
+            quote_err = str(e)[:200]
             out_eth = 0.0
-    pnl = out_eth - buy_eth if out_eth > 0 else -buy_eth
+    # Prefer mark-to-market when sell quote is dead (401 / route fail) so paper PnL isn't fake -100%
     entry_px = fnum(meta.get("entry_price"))
     px = fnum(snap.get("price"))
     chg = ((px - entry_px) / entry_px * 100.0) if entry_px > 0 and px > 0 else None
+    if quote_ok:
+        pnl = out_eth - buy_eth
+    elif chg is not None:
+        # rough: apply chg to notional; still bad on rugs but better than forced -buy_eth
+        pnl = buy_eth * (chg / 100.0)
+        out_eth = buy_eth + pnl
+        reason = f"{reason}|mark_px"
+    else:
+        pnl = -buy_eth
+        reason = f"{reason}|quote_fail"
     st["paper_realized_est"] = fnum(st.get("paper_realized_est")) + pnl
+    # paper day PnL in USD so --daily-loss-usd halt works like live
+    eth_usd = fnum(os.environ.get("RH_ETH_USD"), 1000.0) or 1000.0
+    st["day_realized_est"] = fnum(st.get("day_realized_est")) + pnl * eth_usd
     res = {
         "mode": "dry-run",
         "event": "paper_exit",
@@ -830,6 +927,8 @@ def _paper_close_position(
         "buy_eth": buy_eth,
         "out_eth_est": out_eth,
         "pnl_eth_est": pnl,
+        "quote_ok": quote_ok,
+        "quote_err": quote_err or None,
         "chg_pct": chg,
         "paper_total_est": st["paper_realized_est"],
     }
@@ -971,7 +1070,7 @@ def monitor_positions(cfg: Config, st: dict, with_security: bool = False) -> Non
             if is_paper:
                 res = _paper_close_position(cfg, addr, meta, sym, reason, snap, st)
                 print(
-                    f"[paper_exit] {sym} {reason} pnl≈{res.get('pnl_eth_est', 0):+.6f} ETH "
+                    f"[paper_exit] {sym} {res.get('reason', reason)} pnl≈{res.get('pnl_eth_est', 0):+.6f} ETH "
                     f"total≈{st.get('paper_realized_est', 0):+.6f} ETH",
                     flush=True,
                 )
@@ -979,6 +1078,8 @@ def monitor_positions(cfg: Config, st: dict, with_security: bool = False) -> Non
                 res = emergency_sell(cfg, addr, sym, reason)
                 log_event({**res, "entry_liq": entry_liq, "liq": liq, "drop_pct": drop, "held": held})
             dead.append(addr)
+        except AuthError:
+            raise
         except Exception as e:
             log_event({"event": "emergency_sell_error", "token": addr, "symbol": sym, "error": str(e)[:300]})
             print(f"[RUG_EXIT_ERR] {sym}: {e}", flush=True)
@@ -1058,7 +1159,8 @@ def loop(cfg: Config) -> None:
     est = 3 + cfg.max_positions + (4 * cfg.max_gates_per_tick) / max(cfg.gate_every, 1)
     print(
         f"[start] profile={cfg.profile} buy={cfg.buy_eth}ETH mc=[{cfg.min_mc:.0f},{cfg.max_mc:.0f}] "
-        f"bankr_mc<={cfg.bankr_max_mc:.0f} fresh<={cfg.fresh_max_age_sec}s reheat={'OFF' if cfg.disable_reheat else cfg.reheat_min_vol_1h} "
+        f"bankr_mc<={cfg.bankr_max_mc:.0f} fresh={cfg.fresh_min_age_sec}-{cfg.fresh_max_age_sec}s "
+        f"reheat={'OFF' if cfg.disable_reheat else cfg.reheat_min_vol_1h} "
         f"min_liq={cfg.min_liquidity} top10={cfg.max_top10}/{cfg.max_top10_fresh}@{cfg.fresh_top10_age_sec}s "
         f"unindexed_liq={cfg.allow_unindexed_liq} live={cfg.live}",
         flush=True,
@@ -1080,6 +1182,11 @@ def loop(cfg: Config) -> None:
         flush=True,
     )
     print(f"[runtime] state={STATE_PATH} log={LOG_PATH} paper_positions={cfg.paper_positions}", flush=True)
+    print(
+        f"[filters] lps={','.join(allowed_lp_names(cfg))} min_age={cfg.fresh_min_age_sec}s "
+        f"max_age={cfg.fresh_max_age_sec}s unindexed_liq={cfg.allow_unindexed_liq}",
+        flush=True,
+    )
 
     rate_limit_until = 0.0
 
@@ -1089,7 +1196,8 @@ def loop(cfg: Config) -> None:
         try:
             if time.time() < rate_limit_until:
                 sleep_left = rate_limit_until - time.time()
-                print(f"[rate_limit] cooling {sleep_left:.0f}s", flush=True)
+                tag = "auth" if sleep_left >= cfg.auth_cooldown_sec * 0.8 else "rate_limit"
+                print(f"[{tag}] cooling {sleep_left:.0f}s", flush=True)
                 time.sleep(max(1.0, sleep_left))
                 continue
 
@@ -1103,6 +1211,12 @@ def loop(cfg: Config) -> None:
             do_sec = (tick % max(cfg.mon_security_every, 1) == 0) or cfg.once or (not active and bool(st.get("positions")))
             try:
                 monitor_positions(cfg, st, with_security=do_sec)
+            except AuthError as e:
+                cool = max(float(cfg.auth_cooldown_sec), float(e.sleep_s))
+                rate_limit_until = time.time() + cool
+                log_event({"event": "auth_error", "sleep_s": cool, "where": "monitor", "error": str(e)[:200]})
+                print(f"[auth] monitor cooldown {cool:.0f}s: {e}", flush=True)
+                continue
             except RateLimitError as e:
                 rate_limit_until = time.time() + e.sleep_s
                 log_event({"event": "rate_limit", "sleep_s": e.sleep_s, "where": "monitor"})
@@ -1135,6 +1249,12 @@ def loop(cfg: Config) -> None:
             if open_n < cfg.max_positions:
                 try:
                     cands = fetch_candidates(cfg)
+                except AuthError as e:
+                    cool = max(float(cfg.auth_cooldown_sec), float(e.sleep_s))
+                    rate_limit_until = time.time() + cool
+                    log_event({"event": "auth_error", "sleep_s": cool, "where": "trenches", "error": str(e)[:200]})
+                    print(f"[auth] trenches cooldown {cool:.0f}s: {e}", flush=True)
+                    continue
                 except RateLimitError as e:
                     rate_limit_until = time.time() + e.sleep_s
                     log_event({"event": "rate_limit", "sleep_s": e.sleep_s, "where": "trenches"})
@@ -1167,6 +1287,12 @@ def loop(cfg: Config) -> None:
                             checked += 1
                             try:
                                 ok, reason, snap = pre_entry_gate(cfg, tok)
+                            except AuthError as e:
+                                cool = max(float(cfg.auth_cooldown_sec), float(e.sleep_s))
+                                rate_limit_until = time.time() + cool
+                                log_event({"event": "auth_error", "sleep_s": cool, "where": "gate", "error": str(e)[:200]})
+                                print(f"[auth] gate cooldown {cool:.0f}s: {e}", flush=True)
+                                break
                             except RateLimitError as e:
                                 rate_limit_until = time.time() + e.sleep_s
                                 log_event({"event": "rate_limit", "sleep_s": e.sleep_s, "where": "gate"})
@@ -1263,6 +1389,12 @@ def loop(cfg: Config) -> None:
                                     flush=True,
                                 )
                                 break
+                            except AuthError as e:
+                                cool = max(float(cfg.auth_cooldown_sec), float(e.sleep_s))
+                                rate_limit_until = time.time() + cool
+                                log_event({"event": "auth_error", "sleep_s": cool, "where": "buy", "error": str(e)[:200]})
+                                print(f"[auth] buy cooldown {cool:.0f}s: {e}", flush=True)
+                                break
                             except RateLimitError as e:
                                 rate_limit_until = time.time() + e.sleep_s
                                 log_event({"event": "rate_limit", "sleep_s": e.sleep_s, "where": "buy"})
@@ -1277,6 +1409,12 @@ def loop(cfg: Config) -> None:
             if cfg.once:
                 break
             time.sleep(max(0.0, cfg.poll_sec - (time.time() - t0)))
+        except AuthError as e:
+            cool = max(float(cfg.auth_cooldown_sec), float(e.sleep_s))
+            rate_limit_until = time.time() + cool
+            log_event({"event": "auth_error", "sleep_s": cool, "where": "loop", "error": str(e)[:200]})
+            print(f"[auth] loop cooldown {cool:.0f}s: {e}", flush=True)
+            time.sleep(cool)
         except RateLimitError as e:
             rate_limit_until = time.time() + e.sleep_s
             log_event({"event": "rate_limit", "sleep_s": e.sleep_s, "where": "loop"})
@@ -1290,30 +1428,34 @@ def apply_profile(cfg: Config, name: str, buy_eth_cli: float) -> None:
     """Parameter packs from reversed wallets — style, not address mirror."""
     cfg.profile = name
     if name == "adff":
-        # 荒大宝: ~$50, micro MC, ultra short, FIRST WAVE only
+        # 荒大宝-style scalp, recalibrated on paper100: skip bankr + age0-15, longer hold, lower TP
         cfg.buy_eth = 0.03 if buy_eth_cli == 0.03 else buy_eth_cli
-        cfg.min_mc, cfg.max_mc = 3000, 15000
-        cfg.bankr_max_mc = 35000
-        cfg.fresh_max_age_sec = 120  # was 600 — true first wave, not 10min chase
+        cfg.min_mc, cfg.max_mc = 1000, 50000
+        cfg.bankr_max_mc = 80000
+        cfg.fresh_min_age_sec = 30
+        cfg.fresh_max_age_sec = 90
         cfg.disable_reheat = True
         cfg.reheat_min_vol_1h = 5000
         cfg.reheat_min_swaps_1h = 20
-        cfg.min_liquidity = 800
-        cfg.max_top10 = 0.55
-        cfg.max_top10_fresh = 0.70
-        cfg.fresh_top10_age_sec = 45
-        cfg.allow_unindexed_liq = True
-        cfg.soft_retry_sec = 3
-        # HF reverse of 0xadff: fixed small size, first print ~1.1-1.5x often FULL clear
+        cfg.min_liquidity = 30
+        cfg.max_top10 = 0.70
+        cfg.max_top10_fresh = 0.95
+        cfg.fresh_top10_age_sec = 90
+        cfg.allow_unindexed_liq = False  # unindexed first-wave correlated with lp_drop losses
+        cfg.soft_retry_sec = 2
+        cfg.allowed_lps = ("virtuals", "pons", "noxa", "trench", "flap")  # no bankr
+        # TP lowered so full-clear can fire; hold stretched — 25s almost never hit +12%
         cfg.exit_mode = "hf_full"
-        cfg.tp1, cfg.tp1_pct = 20, 100   # +20% (~1.2x) dump all — matches full-clear peak
+        cfg.tp1, cfg.tp1_pct = 8, 100
         cfg.tp2, cfg.tp2_pct = 50, 0
         cfg.tp3, cfg.tp3_pct = 100, 0
-        cfg.trail_activate_pct = 20
+        cfg.trail_activate_pct = 8
         cfg.trail_drawdown_pct = 25
         cfg.use_trailing = False
-        cfg.hard_sl_pct = cfg.sl = 25
-        cfg.max_hold_sec = 120
+        cfg.hard_sl_pct = cfg.sl = 15
+        cfg.max_hold_sec = 60
+        cfg.lp_drop_pct = 25.0
+        cfg.min_liq_hold = 0.0  # absolute floor kills micro-liq first-wave; rely on lp_drop %
         cfg.use_default_risk = False  # fixed size like $50 template
         cfg.default_risk_pct = 0
     elif name == "7a23":
@@ -1379,11 +1521,13 @@ def build_config(
     min_liq: float | None = None,
     max_top10: float | None = None,
     max_top10_fresh: float | None = None,
+    fresh_min_age: int | None = None,
     fresh_max_age: int | None = None,
     reheat_min_vol: float | None = None,
     allow_unindexed_liq: bool | None = None,
     disable_reheat: bool | None = None,
     soft_retry_sec: int | None = None,
+    allowed_lps: str | None = None,
     lp_drop_pct: float = 35.0,
     min_liq_hold: float = 800.0,
     max_hold_sec: int | None = None,
@@ -1475,6 +1619,8 @@ def build_config(
         cfg.max_top10 = max_top10
     if max_top10_fresh is not None:
         cfg.max_top10_fresh = max_top10_fresh
+    if fresh_min_age is not None:
+        cfg.fresh_min_age_sec = max(0, int(fresh_min_age))
     if fresh_max_age is not None:
         cfg.fresh_max_age_sec = fresh_max_age
     if reheat_min_vol is not None:
@@ -1485,8 +1631,14 @@ def build_config(
         cfg.disable_reheat = disable_reheat
     if soft_retry_sec is not None:
         cfg.soft_retry_sec = max(1, int(soft_retry_sec))
+    if allowed_lps is not None:
+        parts = tuple(p.strip().lower() for p in allowed_lps.split(",") if p.strip())
+        cfg.allowed_lps = parts
     if max_hold_sec is not None:
         cfg.max_hold_sec = max_hold_sec
+    # CLI risk exits must win over profile defaults
+    cfg.lp_drop_pct = lp_drop_pct
+    cfg.min_liq_hold = min_liq_hold
     return cfg
 
 

@@ -47,6 +47,7 @@ def run(
     min_liq: Optional[float] = typer.Option(None, "--min-liq"),
     max_top10: Optional[float] = typer.Option(None, "--max-top10", help="Max top10 holder rate, e.g. 0.55"),
     max_top10_fresh: Optional[float] = typer.Option(None, "--max-top10-fresh", help="Looser top10 while very fresh"),
+    fresh_min_age: Optional[int] = typer.Option(None, "--fresh-min-age", help="Skip entries younger than N seconds"),
     fresh_max_age: Optional[int] = typer.Option(None, "--fresh-max-age"),
     reheat_min_vol: Optional[float] = typer.Option(None, "--reheat-min-vol"),
     allow_unindexed_liq: Optional[bool] = typer.Option(
@@ -56,6 +57,9 @@ def run(
         None, "--disable-reheat/--enable-reheat", help="First-wave only (no reheat entries)"
     ),
     soft_retry_sec: Optional[int] = typer.Option(None, "--soft-retry-sec", help="Soft reject cooldown seconds"),
+    allowed_lps: Optional[str] = typer.Option(
+        None, "--allowed-lps", help="Comma LP allowlist, e.g. virtuals,pons (empty=SAFE_LP)"
+    ),
     lp_drop_pct: float = typer.Option(35.0, "--lp-drop-pct"),
     min_liq_hold: float = typer.Option(800.0, "--min-liq-hold"),
     max_hold_sec: Optional[int] = typer.Option(None, "--max-hold-sec"),
@@ -116,11 +120,13 @@ def run(
         min_liq=min_liq,
         max_top10=max_top10,
         max_top10_fresh=max_top10_fresh,
+        fresh_min_age=fresh_min_age,
         fresh_max_age=fresh_max_age,
         reheat_min_vol=reheat_min_vol,
         allow_unindexed_liq=allow_unindexed_liq,
         disable_reheat=disable_reheat,
         soft_retry_sec=soft_retry_sec,
+        allowed_lps=allowed_lps,
         lp_drop_pct=lp_drop_pct,
         min_liq_hold=min_liq_hold,
         max_hold_sec=max_hold_sec,
