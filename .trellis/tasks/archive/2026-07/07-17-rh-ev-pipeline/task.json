@@ -1,0 +1,34 @@
+{
+  "id": "rh-ev-pipeline",
+  "name": "rh-ev-pipeline",
+  "title": "RH sniper: opportunity set → measurement → hazard",
+  "description": "Implement feedback stack in fixed order: opportunity-set coverage, executable-quote paper measurement, then lp_drop entry hazard. Do not reverse order.",
+  "status": "completed",
+  "dev_type": null,
+  "scope": null,
+  "package": null,
+  "priority": "P0",
+  "creator": "xeron",
+  "assignee": "xeron",
+  "createdAt": "2026-07-17",
+  "completedAt": "2026-07-18",
+  "branch": null,
+  "base_branch": "main",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [
+    "07-17-opp-set-funnel",
+    "07-17-exec-quote-paper",
+    "07-17-lp-drop-hazard"
+  ],
+  "parent": null,
+  "relatedFiles": [
+    "docs/HANDOFF_WINRATE_WALLET_ALIGNMENT.md",
+    "rh_sniper/engine.py",
+    "rh_sniper/cli.py"
+  ],
+  "notes": "All three phases implemented and self-checked; rn2 running paper_ev2 with scan+hazard shadow.",
+  "meta": {}
+}
