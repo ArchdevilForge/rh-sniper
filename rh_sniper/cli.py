@@ -99,12 +99,19 @@ def run(
     ),
     offhours_poll_sec: float = typer.Option(60.0, "--offhours-poll", help="Seconds between checks when resting"),
     timezone_offset_hours: int = typer.Option(8, "--tz-offset", help="Local offset hours (CN=8)"),
+    shadow_collect: bool = typer.Option(False, "--shadow-collect", help="Gate+log only; never buy"),
+    scan_log: bool = typer.Option(True, "--scan-log/--no-scan-log", help="Write opportunity-set scan JSONL"),
+    hazard_mode: str = typer.Option("off", "--hazard-mode", help="off|shadow|enforce lp_drop entry hazard"),
+    hazard_snap_n: Optional[int] = typer.Option(None, "--hazard-snap-n", help="Liquidity snapshots before entry"),
+    hazard_snap_gap: Optional[float] = typer.Option(None, "--hazard-snap-gap", help="Seconds between liq snaps"),
 ) -> None:
     """Start the sniper (dry-run unless --live)."""
     if profile not in {"adff", "7a23", "417c"}:
         raise typer.BadParameter("profile must be adff | 7a23 | 417c")
     if exit_mode and exit_mode not in {"hf_full", "hf_scale", "principal", "wide"}:
         raise typer.BadParameter("exit-mode must be hf_full|hf_scale|principal|wide")
+    if hazard_mode not in {"off", "shadow", "enforce"}:
+        raise typer.BadParameter("hazard-mode must be off|shadow|enforce")
     cfg = build_config(
         wallet=wallet,
         profile=profile,
@@ -157,6 +164,11 @@ def run(
         offhours_mode=offhours_mode,
         offhours_poll_sec=offhours_poll_sec,
         timezone_offset_hours=timezone_offset_hours,
+        shadow_collect=shadow_collect,
+        scan_log_enabled=scan_log,
+        hazard_mode=hazard_mode,
+        hazard_snap_n=hazard_snap_n,
+        hazard_snap_gap_sec=hazard_snap_gap,
     )
     if tp_ladder:
         parts = []

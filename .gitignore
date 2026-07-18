@@ -34,10 +34,26 @@ build/
 # local dumps
 /tmp/
 *.log
-.trellis/
+
+# trellis: track tasks/spec/workflow; ignore local runtime only
+.trellis/.developer
+.trellis/.current-task
+.trellis/.runtime/
+.trellis/.cache/
+.trellis/.backup-*
+.trellis/worktrees/
+.trellis/.template-hashes.json
+.trellis/workspace/
+.trellis/.agents/
+.trellis/.agent-log
+.trellis/.session-id
+.trellis/.ralph-state.json
 
 # runtime dry/live
 state.dry.json
 state.live.json
 trades.dry.jsonl
 trades.live.jsonl
+
+# local paper pulls
+data/paper_ev2/

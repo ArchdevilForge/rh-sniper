@@ -35,4 +35,6 @@ exec .venv/bin/rh-sniper run -p adff --paper-positions \
   --min-liq-hold 0 \
   --max-hold-sec 60 \
   --hard-sl 15 \
-  --tp-ladder 8:100
+  --tp-ladder 8:100 \
+  --scan-log \
+  --hazard-mode shadow

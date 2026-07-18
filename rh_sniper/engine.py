@@ -19,6 +19,7 @@ SAFE_LP = ("pons", "noxa", "trench", "virtuals", "flap")
 # Paths resolved in configure_runtime() after live/dry known
 STATE_PATH = Path(os.environ.get("RH_SNIPER_STATE", "state.json")).expanduser()
 LOG_PATH = Path(os.environ.get("RH_SNIPER_LOG", "trades.jsonl")).expanduser()
+SCAN_LOG_PATH = Path(os.environ.get("RH_SNIPER_SCAN_LOG", "scans.jsonl")).expanduser()
 
 
 class RateLimitError(RuntimeError):
@@ -177,11 +178,21 @@ class Config:
     pnl_refresh_every: int = 15  # ticks
     local_exit_if_no_strategy: bool = True
     auth_cooldown_sec: float = 120.0
+    # opportunity-set / measurement / hazard pipeline
+    scan_log_enabled: bool = True
+    shadow_collect: bool = False  # gate+log only; never buy
+    hazard_mode: str = "off"  # off|shadow|enforce
+    hazard_snap_n: int = 3
+    hazard_snap_gap_sec: float = 2.0
+    hazard_max_single_drop_pct: float = 8.0
+    hazard_max_full_exit_loss_pct: float = 5.0
+    hazard_max_impact_spread_pct: float = 4.0
+    hazard_max_quote_jitter_pct: float = 5.0
 
 
 def configure_runtime(cfg: Config) -> None:
     """Isolate dry/live state+log files unless env overrides."""
-    global STATE_PATH, LOG_PATH
+    global STATE_PATH, LOG_PATH, SCAN_LOG_PATH
     if os.environ.get("RH_SNIPER_STATE"):
         STATE_PATH = Path(os.environ["RH_SNIPER_STATE"]).expanduser()
     else:
@@ -190,9 +201,18 @@ def configure_runtime(cfg: Config) -> None:
         LOG_PATH = Path(os.environ["RH_SNIPER_LOG"]).expanduser()
     else:
         LOG_PATH = Path("trades.live.jsonl" if cfg.live else "trades.dry.jsonl")
+    if os.environ.get("RH_SNIPER_SCAN_LOG"):
+        SCAN_LOG_PATH = Path(os.environ["RH_SNIPER_SCAN_LOG"]).expanduser()
+    else:
+        tag = "live" if cfg.live else ("shadow" if cfg.shadow_collect else "dry")
+        SCAN_LOG_PATH = Path(f"scans.{tag}.jsonl")
     # live always tracks positions; dry only if paper_positions
     if cfg.live:
         cfg.paper_positions = True
+    if cfg.shadow_collect:
+        cfg.live = False
+        cfg.paper_positions = False
+        cfg.max_positions = 0
 
 
 def load_state() -> dict:
@@ -218,6 +238,11 @@ def save_state(st: dict) -> None:
 
 def log_event(obj: dict) -> None:
     with LOG_PATH.open("a") as f:
+        f.write(json.dumps({"ts": int(time.time()), **obj}, ensure_ascii=False) + "\n")
+
+
+def log_scan_event(obj: dict) -> None:
+    with SCAN_LOG_PATH.open("a") as f:
         f.write(json.dumps({"ts": int(time.time()), **obj}, ensure_ascii=False) + "\n")
 
 
@@ -658,6 +683,7 @@ SOFT_REJECT_PREFIXES = (
     "no_buy_route:",
     "top10_pending:",
     "auth:",
+    "hazard:",
 )
 SOFT_RETRY_SEC = 5  # legacy default; prefer cfg.soft_retry_sec
 
@@ -667,6 +693,138 @@ def is_soft_reject(reason: str) -> bool:
     if r == "mc_unknown":
         return True
     return any(r.startswith(p) for p in SOFT_REJECT_PREFIXES)
+
+
+def observe_liq_path(
+    cfg: Config, addr: str, token_row: dict | None = None, n: int = 3, gap: float = 2.0,
+) -> list[dict]:
+    """Take n liquidity snapshots spaced by gap seconds (first is immediate)."""
+    path: list[dict] = []
+    n = max(1, int(n))
+    for i in range(n):
+        if i:
+            time.sleep(max(0.2, float(gap)))
+        snap = token_snapshot(cfg, addr, token_row, with_security=False)
+        path.append({
+            "ts": int(time.time()),
+            "liq": fnum(snap.get("liquidity")),
+            "mc": fnum(snap.get("mc")),
+            "price": fnum(snap.get("price")),
+        })
+    return path
+
+
+def hazard_from_liq_path(cfg: Config, path: list[dict]) -> str | None:
+    if len(path) < 2:
+        return None
+    liqs = [fnum(p.get("liq")) for p in path]
+    if any(x <= 0 for x in liqs):
+        return None  # unindexed — not enough signal
+    drops = []
+    for a, b in zip(liqs, liqs[1:]):
+        if a > 0:
+            drops.append((a - b) / a * 100.0)
+    max_drop = max(drops) if drops else 0.0
+    if max_drop >= cfg.hazard_max_single_drop_pct:
+        return f"liq_drop_{max_drop:.1f}pct"
+    n_down = sum(1 for d in drops if d > 0.5)
+    if n_down >= 2:
+        return f"liq_down_snaps_{n_down}"
+    # slope %/s over whole window
+    t0, t1 = path[0].get("ts") or 0, path[-1].get("ts") or 0
+    dt = max(1.0, float(t1 - t0))
+    slope = (liqs[0] - liqs[-1]) / liqs[0] * 100.0 / dt
+    if slope > 0.5:  # losing >0.5%/s
+        return f"liq_slope_{slope:.2f}pct_s"
+    return None
+
+
+def sell_quote_ladder(cfg: Config, addr: str, planned_tokens: int) -> dict:
+    """25/50/100/200% of planned token amount sell quotes."""
+    out: dict = {"planned_tokens": planned_tokens}
+    if planned_tokens <= 0:
+        out["err"] = "no_planned"
+        return out
+    for tag, mult in (("q25", 0.25), ("q50", 0.5), ("q100", 1.0), ("q200", 2.0)):
+        amt = max(1, int(planned_tokens * mult))
+        try:
+            sq = quote(cfg, addr, NATIVE, str(amt), cfg.slippage)
+            eth = int(sq.get("output_amount") or 0) / 1e18
+            out[tag] = eth
+            out[f"{tag}_ok"] = eth > 0
+        except AuthError:
+            raise
+        except Exception as e:
+            out[tag] = 0.0
+            out[f"{tag}_ok"] = False
+            out[f"{tag}_err"] = str(e)[:120]
+    return out
+
+
+def hazard_from_depth(cfg: Config, ladder: dict, buy_eth: float) -> str | None:
+    if buy_eth <= 0:
+        return None
+    q100 = fnum(ladder.get("q100"))
+    q50 = fnum(ladder.get("q50"))
+    if ladder.get("q100_ok") and q100 > 0:
+        loss = (buy_eth - q100) / buy_eth * 100.0
+        if loss > cfg.hazard_max_full_exit_loss_pct:
+            return f"full_exit_loss_{loss:.1f}pct"
+    if ladder.get("q50_ok") and ladder.get("q100_ok") and q50 > 0 and q100 > 0:
+        # scale 50% quote to full notionally: 2*q50 vs q100
+        imp_spread = abs(2 * q50 - q100) / buy_eth * 100.0
+        if imp_spread > cfg.hazard_max_impact_spread_pct:
+            return f"impact_spread_{imp_spread:.1f}pct"
+    if not ladder.get("q200_ok") and ladder.get("q100_ok"):
+        return "stress_200_missing"
+    # jitter between 100 and 50-scaled
+    if ladder.get("q50_ok") and ladder.get("q100_ok") and q50 > 0:
+        jitter = abs(2 * q50 - q100) / max(2 * q50, 1e-12) * 100.0
+        if jitter > cfg.hazard_max_quote_jitter_pct:
+            return f"quote_jitter_{jitter:.1f}pct"
+    return None
+
+
+def compact_sell_ladder(ladder: dict | None) -> dict | None:
+    """JSONL-safe sell ladder: numeric legs only (no huge errs)."""
+    if not ladder:
+        return None
+    out: dict = {}
+    for k in ("planned_tokens", "q25", "q50", "q100", "q200",
+              "q25_ok", "q50_ok", "q100_ok", "q200_ok", "err"):
+        if k in ladder and ladder[k] is not None:
+            out[k] = ladder[k]
+    return out or None
+
+
+def compact_liq_path(path: list | None, max_n: int = 5) -> list | None:
+    if not path:
+        return None
+    out = []
+    for p in path[:max_n]:
+        out.append({
+            "ts": p.get("ts"),
+            "liq": p.get("liq"),
+            "mc": p.get("mc"),
+        })
+    return out
+
+
+def gate_audit_fields(snap: dict | None) -> dict:
+    """Pre-entry fields that MUST land on buy/shadow/reject for offline EV.
+
+    Without these on *accepted* buys, hazard shadow cannot be scored
+    (paper_ev2 lesson: all rejects died before hazard; buys omitted fields).
+    """
+    snap = snap or {}
+    return {
+        "age": snap.get("age"),
+        "hazard_liq": snap.get("hazard_liq"),
+        "hazard_depth": snap.get("hazard_depth"),
+        "hazard_liq_err": snap.get("hazard_liq_err"),
+        "liq_path": compact_liq_path(snap.get("liq_path")),
+        "sell_ladder": compact_sell_ladder(snap.get("sell_ladder")),
+    }
 
 
 def pre_entry_gate(cfg: Config, token: dict) -> tuple[bool, str, dict]:
@@ -731,6 +889,19 @@ def pre_entry_gate(cfg: Config, token: dict) -> tuple[bool, str, dict]:
         return False, f"timing:{why}", snap
     snap["entry_mode"] = mode
     snap["entry_why"] = why
+    # cheap filters passed — optional multi-snap liq path (hazard)
+    if cfg.hazard_mode in ("shadow", "enforce") and cfg.hazard_snap_n > 1:
+        try:
+            path = observe_liq_path(cfg, addr, token, n=cfg.hazard_snap_n, gap=cfg.hazard_snap_gap_sec)
+            snap["liq_path"] = path
+            hz = hazard_from_liq_path(cfg, path)
+            snap["hazard_liq"] = hz
+            if hz and cfg.hazard_mode == "enforce":
+                return False, f"hazard:{hz}", snap
+        except AuthError:
+            raise
+        except Exception as e:
+            snap["hazard_liq_err"] = str(e)[:120]
     buy_eth = resolve_buy_eth(cfg)
     if buy_eth <= 0:
         return False, "buy_size_zero", snap
@@ -746,14 +917,16 @@ def pre_entry_gate(cfg: Config, token: dict) -> tuple[bool, str, dict]:
     out_amt = str(bq.get("output_amount") or "0")
     if out_amt in ("0", "", "None"):
         return False, "buy_quote_zero_out", snap
-    if cfg.require_sell_quote:
-        try:
-            sell_amt = str(max(int(int(out_amt) * 0.5), 1))
-            quote(cfg, addr, NATIVE, sell_amt, cfg.slippage)
-        except AuthError:
-            raise
-        except Exception as e:
-            return False, f"no_sell_route:{e}", snap
+    planned = int(out_amt)
+    ladder = sell_quote_ladder(cfg, addr, planned)
+    snap["sell_ladder"] = ladder
+    if cfg.require_sell_quote and not ladder.get("q50_ok") and not ladder.get("q100_ok"):
+        return False, f"no_sell_route:{ladder.get('err') or 'ladder_fail'}", snap
+    if cfg.hazard_mode in ("shadow", "enforce"):
+        dh = hazard_from_depth(cfg, ladder, buy_eth)
+        snap["hazard_depth"] = dh
+        if dh and cfg.hazard_mode == "enforce":
+            return False, f"hazard:{dh}", snap
     return True, f"ok:{mode}", snap
 
 
@@ -808,8 +981,11 @@ def fetch_candidates(cfg: Config) -> list[dict]:
             t["_cat"] = cat
             t["_lp"] = lp
             t["_fresh"] = is_fresh
+            t["_server_order"] = len([x for x in out if x.get("_cat") == cat])
             out.append(t)
     out.sort(key=lambda x: (0 if x.get("_fresh") else 1, -fnum(x.get("volume_1h") or x.get("volume_24h")), x.get("_age", 1e18)))
+    for i, t in enumerate(out):
+        t["_client_rank"] = i
     return out
 
 
@@ -861,79 +1037,156 @@ def buy(cfg: Config, token: str, symbol: str, buy_eth: float | None = None) -> d
     return out
 
 
-def _paper_price_exit(cfg: Config, meta: dict, snap: dict) -> str | None:
-    """Dry-run paper: simulate condition-order TP/SL from live price."""
-    entry_px = fnum(meta.get("entry_price"))
-    px = fnum(snap.get("price"))
-    if entry_px <= 0 or px <= 0:
-        return None
-    chg = (px - entry_px) / entry_px * 100.0
-    sl = fnum(cfg.hard_sl_pct or cfg.sl)
-    if chg <= -sl:
-        return f"hard_sl_{chg:.1f}pct"
-    for scale, ratio, tag in (
-        (cfg.tp1, cfg.tp1_pct, "tp1"),
-        (cfg.tp2, cfg.tp2_pct, "tp2"),
-        (cfg.tp3, cfg.tp3_pct, "tp3"),
-    ):
-        if ratio > 0 and chg >= scale:
-            return f"{tag}_{chg:.1f}pct"
-    return None
-
-
-def _paper_close_position(
-    cfg: Config, addr: str, meta: dict, sym: str, reason: str, snap: dict, st: dict,
-) -> dict:
-    """Quote sell and estimate PnL in native for paper dry-run."""
+def _ensure_paper_inventory(meta: dict) -> None:
+    """Backfill inventory fields for positions opened before exec-quote paper."""
+    if meta.get("remaining_tokens") is not None and meta.get("remaining_cost_basis") is not None:
+        return
+    tok = str(meta.get("quote_out") or meta.get("initial_tokens") or "0")
+    try:
+        tokens = int(tok)
+    except Exception:
+        tokens = 0
     buy_eth = fnum(meta.get("buy_eth"))
-    tok_amt = str(meta.get("quote_out") or "0")
-    out_eth = 0.0
-    quote_ok = False
-    quote_err = ""
-    if tok_amt not in ("0", "", "None"):
-        try:
-            sq = quote(cfg, addr, NATIVE, tok_amt, cfg.slippage)
-            out_eth = int(sq.get("output_amount") or 0) / 1e18
-            quote_ok = out_eth > 0
-        except AuthError:
-            raise
-        except Exception as e:
-            quote_err = str(e)[:200]
-            out_eth = 0.0
-    # Prefer mark-to-market when sell quote is dead (401 / route fail) so paper PnL isn't fake -100%
-    entry_px = fnum(meta.get("entry_price"))
-    px = fnum(snap.get("price"))
-    chg = ((px - entry_px) / entry_px * 100.0) if entry_px > 0 and px > 0 else None
-    if quote_ok:
-        pnl = out_eth - buy_eth
-    elif chg is not None:
-        # rough: apply chg to notional; still bad on rugs but better than forced -buy_eth
-        pnl = buy_eth * (chg / 100.0)
-        out_eth = buy_eth + pnl
-        reason = f"{reason}|mark_px"
-    else:
-        pnl = -buy_eth
-        reason = f"{reason}|quote_fail"
+    meta.setdefault("initial_tokens", str(tokens))
+    meta["remaining_tokens"] = str(tokens)
+    meta["remaining_cost_basis"] = buy_eth
+    meta.setdefault("realized_eth", 0.0)
+    meta.setdefault("sold_tokens", "0")
+    meta.setdefault("tp1_filled", False)
+    meta.setdefault("tp2_filled", False)
+    meta.setdefault("tp3_filled", False)
+    meta.setdefault("peak_executable_return", 0.0)
+    meta.setdefault("unpriced_streak", 0)
+
+
+def _paper_sell_quote(cfg: Config, addr: str, token_amount: str) -> tuple[bool, float, str]:
+    if not token_amount or token_amount in ("0", "None"):
+        return False, 0.0, "zero_tokens"
+    try:
+        sq = quote(cfg, addr, NATIVE, str(token_amount), cfg.slippage)
+        out_eth = int(sq.get("output_amount") or 0) / 1e18
+        if out_eth <= 0:
+            return False, 0.0, "zero_out"
+        return True, out_eth, ""
+    except AuthError:
+        raise
+    except Exception as e:
+        return False, 0.0, str(e)[:200]
+
+
+def _paper_exec_exit(
+    cfg: Config, meta: dict, exec_ret_pct: float,
+) -> tuple[str | None, float]:
+    """Match TP/SL/trail on executable return % (full remaining exit). Returns (reason, sell_ratio_pct)."""
+    sl = fnum(cfg.hard_sl_pct or cfg.sl)
+    if exec_ret_pct <= -sl:
+        return f"hard_sl_{exec_ret_pct:.1f}pct", 100.0
+    for scale, ratio, tag, filled_key in (
+        (cfg.tp1, cfg.tp1_pct, "tp1", "tp1_filled"),
+        (cfg.tp2, cfg.tp2_pct, "tp2", "tp2_filled"),
+        (cfg.tp3, cfg.tp3_pct, "tp3", "tp3_filled"),
+    ):
+        if ratio <= 0 or meta.get(filled_key):
+            continue
+        if exec_ret_pct >= float(scale):
+            return f"{tag}_{exec_ret_pct:.1f}pct", float(ratio)
+    if cfg.use_trailing:
+        peak = fnum(meta.get("peak_executable_return"))
+        act = fnum(cfg.trail_activate_pct)
+        dd = fnum(cfg.trail_drawdown_pct)
+        if peak * 100.0 >= act and dd > 0:
+            draw = (peak - exec_ret_pct / 100.0) / max(peak, 1e-12) * 100.0
+            if draw >= dd:
+                return f"trail_dd_{draw:.1f}pct", 100.0
+    return None, 0.0
+
+
+def _paper_apply_realized(st: dict, pnl: float) -> None:
     st["paper_realized_est"] = fnum(st.get("paper_realized_est")) + pnl
-    # paper day PnL in USD so --daily-loss-usd halt works like live
     eth_usd = fnum(os.environ.get("RH_ETH_USD"), 1000.0) or 1000.0
     st["day_realized_est"] = fnum(st.get("day_realized_est")) + pnl * eth_usd
-    res = {
+
+
+def _paper_partial_or_close(
+    cfg: Config,
+    addr: str,
+    meta: dict,
+    sym: str,
+    reason: str,
+    sell_ratio_pct: float,
+    out_eth_full: float,
+    st: dict,
+    *,
+    quote_ok: bool,
+    quote_err: str = "",
+    exec_ret_pct: float | None = None,
+) -> dict | None:
+    """Sell sell_ratio_pct of remaining tokens via pro-rata full-exit quote. None if still open."""
+    _ensure_paper_inventory(meta)
+    rem_tok = int(meta.get("remaining_tokens") or 0)
+    rem_cost = fnum(meta.get("remaining_cost_basis"))
+    if rem_tok <= 0 or rem_cost <= 0:
+        return {"event": "paper_exit", "symbol": sym, "token": addr, "reason": reason, "pnl_eth_est": 0.0}
+    ratio = max(0.0, min(100.0, float(sell_ratio_pct))) / 100.0
+    if ratio <= 0:
+        return None
+    sell_tok = rem_tok if ratio >= 0.999 else max(1, int(rem_tok * ratio))
+    sell_tok = min(sell_tok, rem_tok)
+    frac = sell_tok / rem_tok
+    out_eth = out_eth_full * frac if quote_ok else 0.0
+    cost_sold = rem_cost * frac
+    if not quote_ok:
+        # unpriced: do not invent PnL; keep position and log
+        meta["unpriced_streak"] = int(meta.get("unpriced_streak") or 0) + 1
+        log_event({
+            "event": "unpriced_interval",
+            "symbol": sym,
+            "token": addr,
+            "reason": reason,
+            "quote_err": quote_err or None,
+            "unpriced_streak": meta["unpriced_streak"],
+        })
+        return None
+    pnl = out_eth - cost_sold
+    meta["realized_eth"] = fnum(meta.get("realized_eth")) + pnl
+    meta["remaining_tokens"] = str(rem_tok - sell_tok)
+    meta["remaining_cost_basis"] = rem_cost - cost_sold
+    meta["sold_tokens"] = str(int(meta.get("sold_tokens") or 0) + sell_tok)
+    meta["unpriced_streak"] = 0
+    meta["last_quote_ok"] = True
+    _paper_apply_realized(st, pnl)
+    for tag, key in (("tp1", "tp1_filled"), ("tp2", "tp2_filled"), ("tp3", "tp3_filled")):
+        if reason.startswith(tag):
+            meta[key] = True
+    closed = int(meta["remaining_tokens"] or 0) <= 0 or ratio >= 0.999
+    base = {
         "mode": "dry-run",
-        "event": "paper_exit",
         "symbol": sym,
         "token": addr,
         "reason": reason,
-        "buy_eth": buy_eth,
+        "buy_eth": fnum(meta.get("buy_eth")),
+        "sold_tokens": str(sell_tok),
+        "remaining_tokens": meta["remaining_tokens"],
         "out_eth_est": out_eth,
         "pnl_eth_est": pnl,
-        "quote_ok": quote_ok,
-        "quote_err": quote_err or None,
-        "chg_pct": chg,
-        "paper_total_est": st["paper_realized_est"],
+        "exec_ret_pct": exec_ret_pct,
+        "quote_ok": True,
+        "paper_total_est": st.get("paper_realized_est"),
+        "realized_eth_pos": meta.get("realized_eth"),
     }
-    log_event(res)
-    return res
+    if closed:
+        # inventory conservation check
+        init = int(meta.get("initial_tokens") or 0)
+        sold = int(meta.get("sold_tokens") or 0)
+        rem = int(meta.get("remaining_tokens") or 0)
+        base["event"] = "paper_exit"
+        base["inventory_ok"] = (init == sold + rem) if init else True
+        base["pnl_eth_est"] = fnum(meta.get("realized_eth"))  # full lifecycle realized
+        log_event(base)
+        return base
+    base["event"] = "paper_partial_exit"
+    log_event(base)
+    return None  # still open
 
 
 def emergency_sell(cfg: Config, token: str, symbol: str, reason: str) -> dict:
@@ -1026,16 +1279,59 @@ def monitor_positions(cfg: Config, st: dict, with_security: bool = False) -> Non
         liq = snap["liquidity"]
         drop = ((entry_liq - liq) / entry_liq * 100.0) if entry_liq > 0 else 0.0
         reason = None
+        sell_ratio = 100.0
+        exec_ret_pct = None
+        out_eth_full = 0.0
+        quote_ok = False
+        quote_err = ""
         if is_paper:
-            reason = _paper_price_exit(cfg, meta, snap)
+            _ensure_paper_inventory(meta)
+            rem_tok = str(meta.get("remaining_tokens") or "0")
+            rem_cost = fnum(meta.get("remaining_cost_basis"))
+            quote_ok, out_eth_full, quote_err = _paper_sell_quote(cfg, addr, rem_tok)
+            if quote_ok and rem_cost > 0:
+                exec_ret = out_eth_full / rem_cost - 1.0
+                exec_ret_pct = exec_ret * 100.0
+                peak = max(fnum(meta.get("peak_executable_return")), exec_ret)
+                meta["peak_executable_return"] = peak
+                meta["last_exec_ret_pct"] = exec_ret_pct
+                meta["last_quote_ok"] = True
+                meta["unpriced_streak"] = 0
+                log_event({
+                    "event": "paper_quote_tick",
+                    "symbol": sym,
+                    "token": addr,
+                    "remaining_tokens": rem_tok,
+                    "out_eth": out_eth_full,
+                    "exec_ret_pct": exec_ret_pct,
+                    "peak_exec_ret": peak,
+                    "quote_ok": True,
+                })
+                reason, sell_ratio = _paper_exec_exit(cfg, meta, exec_ret_pct)
+            else:
+                meta["last_quote_ok"] = False
+                meta["unpriced_streak"] = int(meta.get("unpriced_streak") or 0) + 1
+                log_event({
+                    "event": "paper_quote_tick",
+                    "symbol": sym,
+                    "token": addr,
+                    "remaining_tokens": rem_tok,
+                    "quote_ok": False,
+                    "quote_err": quote_err,
+                    "unpriced_streak": meta["unpriced_streak"],
+                })
         if with_security and (snap["honeypot"] or _explicit_unsellable(snap["raw_sec"], cfg.chain)):
             reason = "unsellable_or_honeypot"
+            sell_ratio = 100.0
         elif entry_liq > 0 and drop >= cfg.lp_drop_pct:
             reason = f"lp_drop_{drop:.0f}pct"
+            sell_ratio = 100.0
         elif liq > 0 and liq < cfg.min_liq_hold:
             reason = f"liq_floor_{liq:.0f}"
+            sell_ratio = 100.0
         elif held >= cfg.max_hold_sec:
             reason = f"max_hold_{held}s"
+            sell_ratio = 100.0
         # local exit if strategy missing and held long enough
         if (
             cfg.live
@@ -1044,14 +1340,16 @@ def monitor_positions(cfg: Config, st: dict, with_security: bool = False) -> Non
             and held >= min(60, cfg.max_hold_sec)
         ):
             reason = reason or "no_strategy_timeout"
+            sell_ratio = 100.0
         entry_cbal = fnum(meta.get("creator_token_balance"))
         cbal = fnum(snap.get("creator_token_balance"))
         if with_security and entry_cbal > 0 and cbal < entry_cbal * 0.5:
             reason = reason or f"creator_dump {entry_cbal:.0f}->{cbal:.0f}"
+            sell_ratio = 100.0
         print(
             f"[mon] {sym} held={held}s liq={liq:.0f} entry={entry_liq:.0f} drop={drop:.1f}% "
             f"sec={int(with_security)} can_sell={snap['can_sell']}"
-            + (f" chg={meta.get('last_chg_pct', 0):+.1f}%" if is_paper and meta.get("last_chg_pct") is not None else ""),
+            + (f" exec={exec_ret_pct:+.1f}%" if is_paper and exec_ret_pct is not None else ""),
             flush=True,
         )
         if not reason:
@@ -1060,24 +1358,33 @@ def monitor_positions(cfg: Config, st: dict, with_security: bool = False) -> Non
             if with_security:
                 meta["creator_token_balance"] = cbal
                 meta["creator_token_status"] = snap.get("creator_token_status")
-            entry_px = fnum(meta.get("entry_price"))
-            px = fnum(snap.get("price"))
-            if is_paper and entry_px > 0 and px > 0:
-                meta["last_chg_pct"] = (px - entry_px) / entry_px * 100.0
             continue
         print(f"[RUG_EXIT] {sym} reason={reason}", flush=True)
         try:
             if is_paper:
-                res = _paper_close_position(cfg, addr, meta, sym, reason, snap, st)
-                print(
-                    f"[paper_exit] {sym} {res.get('reason', reason)} pnl≈{res.get('pnl_eth_est', 0):+.6f} ETH "
-                    f"total≈{st.get('paper_realized_est', 0):+.6f} ETH",
-                    flush=True,
+                # need full quote for full exits if we only had unpriced tick
+                if not quote_ok:
+                    quote_ok, out_eth_full, quote_err = _paper_sell_quote(
+                        cfg, addr, str(meta.get("remaining_tokens") or "0")
+                    )
+                closed = _paper_partial_or_close(
+                    cfg, addr, meta, sym, reason, sell_ratio, out_eth_full, st,
+                    quote_ok=quote_ok, quote_err=quote_err, exec_ret_pct=exec_ret_pct,
                 )
+                if closed:
+                    print(
+                        f"[paper_exit] {sym} {closed.get('reason', reason)} "
+                        f"pnl≈{closed.get('pnl_eth_est', 0):+.6f} ETH "
+                        f"total≈{st.get('paper_realized_est', 0):+.6f} ETH",
+                        flush=True,
+                    )
+                    dead.append(addr)
+                else:
+                    print(f"[paper_partial] {sym} {reason} rem={meta.get('remaining_tokens')}", flush=True)
             else:
                 res = emergency_sell(cfg, addr, sym, reason)
                 log_event({**res, "entry_liq": entry_liq, "liq": liq, "drop_pct": drop, "held": held})
-            dead.append(addr)
+                dead.append(addr)
         except AuthError:
             raise
         except Exception as e:
@@ -1181,10 +1488,11 @@ def loop(cfg: Config) -> None:
         f"tz=UTC+{cfg.timezone_offset_hours}",
         flush=True,
     )
-    print(f"[runtime] state={STATE_PATH} log={LOG_PATH} paper_positions={cfg.paper_positions}", flush=True)
+    print(f"[runtime] state={STATE_PATH} log={LOG_PATH} scan={SCAN_LOG_PATH} paper_positions={cfg.paper_positions}", flush=True)
     print(
         f"[filters] lps={','.join(allowed_lp_names(cfg))} min_age={cfg.fresh_min_age_sec}s "
-        f"max_age={cfg.fresh_max_age_sec}s unindexed_liq={cfg.allow_unindexed_liq}",
+        f"max_age={cfg.fresh_max_age_sec}s unindexed_liq={cfg.allow_unindexed_liq} "
+        f"shadow={cfg.shadow_collect} hazard={cfg.hazard_mode} scan_log={cfg.scan_log_enabled}",
         flush=True,
     )
 
@@ -1269,22 +1577,64 @@ def loop(cfg: Config) -> None:
                 )
                 if cands and (tick % max(cfg.gate_every, 1) == 0 or cfg.once):
                     checked = 0
+                    scan_ts = int(time.time())
+                    scan_rows: list[dict] = []
+                    for tok in cands:
+                        scan_rows.append({
+                            "event": "scan_candidate",
+                            "scan_ts": scan_ts,
+                            "tick": tick,
+                            "category": tok.get("_cat"),
+                            "token": (tok.get("address") or "").lower(),
+                            "symbol": tok.get("symbol") or "?",
+                            "server_order": tok.get("_server_order"),
+                            "client_rank": tok.get("_client_rank"),
+                            "age": tok.get("_age"),
+                            "lp": tok.get("_lp"),
+                            "mc": fnum(tok.get("usd_market_cap") or tok.get("market_cap")),
+                            "liq": fnum(tok.get("liquidity")),
+                            "vol_1h": fnum(tok.get("volume_1h") or tok.get("volume_24h")),
+                            "was_selected_for_gate": False,
+                            "not_selected_reason": "pending",
+                            "gate_result": None,
+                        })
+                    row_by_addr = {r["token"]: r for r in scan_rows if r.get("token")}
                     try:
                         soft_seen = st.setdefault("soft_seen", {})
                         now_i = int(time.time())
+                        bought_break = False
                         for tok in cands:
-                            if checked >= cfg.max_gates_per_tick:
+                            if bought_break:
                                 break
                             addr = tok["address"].lower()
+                            row = row_by_addr.get(addr)
+                            if checked >= cfg.max_gates_per_tick:
+                                if row and row.get("not_selected_reason") == "pending":
+                                    row["not_selected_reason"] = "beyond_max_gates"
+                                # mark remaining
+                                for r in scan_rows:
+                                    if r.get("not_selected_reason") == "pending" and r["token"] != addr:
+                                        if r["client_rank"] is not None and tok.get("_client_rank") is not None:
+                                            if r["client_rank"] >= tok.get("_client_rank", 0):
+                                                r["not_selected_reason"] = "beyond_max_gates"
+                                break
                             if addr in st["seen"] or addr in (st.get("positions") or {}):
+                                if row:
+                                    row["not_selected_reason"] = "already_seen" if addr in st["seen"] else "has_position"
                                 continue
-                            # soft cooldown only — hard bans live in seen
                             soft_ts = int(soft_seen.get(addr) or 0)
                             age_hint = tok.get("_age")
                             if soft_ts and now_i - soft_ts < soft_retry_wait(cfg, age_hint):
+                                if row:
+                                    row["not_selected_reason"] = "soft_cooldown"
                                 continue
                             sym = tok.get("symbol") or "?"
                             checked += 1
+                            gate_started = int(time.time())
+                            if row:
+                                row["was_selected_for_gate"] = True
+                                row["not_selected_reason"] = None
+                                row["gate_started_ts"] = gate_started
                             try:
                                 ok, reason, snap = pre_entry_gate(cfg, tok)
                             except AuthError as e:
@@ -1292,15 +1642,21 @@ def loop(cfg: Config) -> None:
                                 rate_limit_until = time.time() + cool
                                 log_event({"event": "auth_error", "sleep_s": cool, "where": "gate", "error": str(e)[:200]})
                                 print(f"[auth] gate cooldown {cool:.0f}s: {e}", flush=True)
+                                if row:
+                                    row["gate_result"] = "auth_error"
                                 break
                             except RateLimitError as e:
                                 rate_limit_until = time.time() + e.sleep_s
                                 log_event({"event": "rate_limit", "sleep_s": e.sleep_s, "where": "gate"})
+                                if row:
+                                    row["gate_result"] = "rate_limit"
                                 break
+                            if row:
+                                row["gate_finished_ts"] = int(time.time())
+                                row["gate_result"] = "ok" if ok else f"reject:{reason}"
                             if not ok:
                                 soft = is_soft_reject(reason)
                                 age_now = snap.get("age") if snap else age_hint
-                                # past first-wave window: stop thrashing zero-liq ghosts
                                 if soft and age_now is not None and age_now > cfg.fresh_max_age_sec and str(reason).startswith(
                                     ("low_liq:", "top10_pending:", "no_buy_route:", "buy_quote_zero_out")
                                 ):
@@ -1313,12 +1669,15 @@ def loop(cfg: Config) -> None:
                                 log_event({
                                     "event": "reject", "token": addr, "symbol": sym, "reason": reason,
                                     "mc": snap.get("mc"), "liq": snap.get("liquidity"),
-                                    "age": snap.get("age"), "lp": snap.get("launchpad") or tok.get("_lp"),
+                                    "lp": snap.get("launchpad") or tok.get("_lp"),
                                     "soft": soft,
+                                    "client_rank": tok.get("_client_rank"),
+                                    "scan_ts": scan_ts,
+                                    "gate_started_ts": gate_started,
+                                    **gate_audit_fields(snap),
                                 })
                                 print(f"[reject] {sym} {reason} mc={snap.get('mc', 0):.0f} liq={snap.get('liquidity', 0):.0f}", flush=True)
                                 continue
-                            # passed gate — permanent seen (avoid double-buy races)
                             st["seen"][addr] = now_i
                             soft_seen.pop(addr, None)
                             print(
@@ -1328,6 +1687,21 @@ def loop(cfg: Config) -> None:
                                 flush=True,
                             )
                             try:
+                                if cfg.shadow_collect:
+                                    log_event({
+                                        "event": "shadow_signal",
+                                        "token": addr,
+                                        "symbol": sym,
+                                        "mode": snap.get("entry_mode"),
+                                        "mc": snap.get("mc"),
+                                        "liq": snap.get("liquidity"),
+                                        "lp": snap.get("launchpad") or tok.get("_lp"),
+                                        "client_rank": tok.get("_client_rank"),
+                                        "scan_ts": scan_ts,
+                                        **gate_audit_fields(snap),
+                                    })
+                                    print(f"[shadow] skip buy {sym}", flush=True)
+                                    continue
                                 if cfg.probe_eth > 0:
                                     pok, preason, pmeta = probe_trade(cfg, tok["address"], sym)
                                     log_event({
@@ -1341,10 +1715,12 @@ def loop(cfg: Config) -> None:
                                 next_size = float(snap.get("buy_eth") or resolve_buy_eth(cfg))
                                 ok_exp, exp_reason = exposure_ok(cfg, st, next_size)
                                 if not ok_exp:
-                                    # portfolio limit, not token quality — allow retry later
                                     st["seen"].pop(addr, None)
                                     soft_seen[addr] = int(time.time())
-                                    log_event({"event": "reject", "token": addr, "symbol": sym, "reason": exp_reason, "soft": True})
+                                    log_event({
+                                        "event": "reject", "token": addr, "symbol": sym, "reason": exp_reason,
+                                        "soft": True, "client_rank": tok.get("_client_rank"), "scan_ts": scan_ts,
+                                    })
                                     print(f"[reject] {sym} {exp_reason}", flush=True)
                                     continue
                                 res = buy(cfg, tok["address"], sym, buy_eth=next_size)
@@ -1361,8 +1737,16 @@ def loop(cfg: Config) -> None:
                                     "mode": snap.get("entry_mode"),
                                     "why": snap.get("entry_why"),
                                     "lp": snap.get("launchpad") or tok.get("_lp"),
+                                    "client_rank": tok.get("_client_rank"),
+                                    "scan_ts": scan_ts,
+                                    **gate_audit_fields(snap),
                                 })
                                 if cfg.live or cfg.paper_positions:
+                                    q_out = str(res.get("quote_out") or "0")
+                                    try:
+                                        init_tok = int(q_out)
+                                    except Exception:
+                                        init_tok = 0
                                     st.setdefault("positions", {})[addr] = {
                                         "symbol": sym,
                                         "ts": int(time.time()),
@@ -1370,7 +1754,17 @@ def loop(cfg: Config) -> None:
                                         "entry_liq": entry_liq,
                                         "entry_mc": snap.get("mc"),
                                         "entry_price": snap.get("price"),
-                                        "quote_out": res.get("quote_out"),
+                                        "quote_out": q_out,
+                                        "initial_tokens": str(init_tok),
+                                        "remaining_tokens": str(init_tok),
+                                        "remaining_cost_basis": next_size,
+                                        "realized_eth": 0.0,
+                                        "sold_tokens": "0",
+                                        "tp1_filled": False,
+                                        "tp2_filled": False,
+                                        "tp3_filled": False,
+                                        "peak_executable_return": 0.0,
+                                        "unpriced_streak": 0,
                                         "entry_mode": snap.get("entry_mode"),
                                         "lp": snap.get("launchpad") or tok.get("_lp"),
                                         "mode": res.get("mode"),
@@ -1388,6 +1782,10 @@ def loop(cfg: Config) -> None:
                                     f"order={res.get('order_status')} strategy_ok={res.get('strategy_ok')}",
                                     flush=True,
                                 )
+                                bought_break = True
+                                for r in scan_rows:
+                                    if r.get("not_selected_reason") == "pending":
+                                        r["not_selected_reason"] = "bought_break"
                                 break
                             except AuthError as e:
                                 cool = max(float(cfg.auth_cooldown_sec), float(e.sleep_s))
@@ -1404,6 +1802,11 @@ def loop(cfg: Config) -> None:
                                 print(f"[buy_err] {sym}: {e}", flush=True)
                                 break
                     finally:
+                        if cfg.scan_log_enabled and scan_rows:
+                            for r in scan_rows:
+                                if r.get("not_selected_reason") == "pending":
+                                    r["not_selected_reason"] = "not_reached"
+                                log_scan_event(r)
                         save_state(st)
 
             if cfg.once:
@@ -1559,6 +1962,11 @@ def build_config(
     offhours_poll_sec: float = 60.0,
     timezone_offset_hours: int = 8,
     confirm_orders: bool = True,
+    shadow_collect: bool = False,
+    scan_log_enabled: bool = True,
+    hazard_mode: str = "off",
+    hazard_snap_n: int | None = None,
+    hazard_snap_gap_sec: float | None = None,
 ) -> Config:
     cfg = Config(
         wallet=wallet or os.environ.get("GMGN_WALLET", "0x37e9f4a84693bce7f7729612ee91a94c91eef898"),
@@ -1593,6 +2001,9 @@ def build_config(
         offhours_poll_sec=offhours_poll_sec,
         timezone_offset_hours=timezone_offset_hours,
         confirm_orders=confirm_orders,
+        shadow_collect=shadow_collect,
+        scan_log_enabled=scan_log_enabled,
+        hazard_mode=(hazard_mode or "off").lower(),
     )
     apply_profile(cfg, profile, buy_eth)
     if exit_mode:
@@ -1636,6 +2047,12 @@ def build_config(
         cfg.allowed_lps = parts
     if max_hold_sec is not None:
         cfg.max_hold_sec = max_hold_sec
+    if hazard_snap_n is not None:
+        cfg.hazard_snap_n = max(1, int(hazard_snap_n))
+    if hazard_snap_gap_sec is not None:
+        cfg.hazard_snap_gap_sec = max(0.2, float(hazard_snap_gap_sec))
+    if cfg.hazard_mode not in ("off", "shadow", "enforce"):
+        cfg.hazard_mode = "off"
     # CLI risk exits must win over profile defaults
     cfg.lp_drop_pct = lp_drop_pct
     cfg.min_liq_hold = min_liq_hold
