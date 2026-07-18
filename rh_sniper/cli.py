@@ -104,6 +104,9 @@ def run(
     hazard_mode: str = typer.Option("off", "--hazard-mode", help="off|shadow|enforce lp_drop entry hazard"),
     hazard_snap_n: Optional[int] = typer.Option(None, "--hazard-snap-n", help="Liquidity snapshots before entry"),
     hazard_snap_gap: Optional[float] = typer.Option(None, "--hazard-snap-gap", help="Seconds between liq snaps"),
+    max_client_rank: Optional[int] = typer.Option(
+        None, "--max-client-rank", help="Max trenches client_rank (0=best only); omit=no cap"
+    ),
 ) -> None:
     """Start the sniper (dry-run unless --live)."""
     if profile not in {"adff", "7a23", "417c"}:
@@ -169,6 +172,7 @@ def run(
         hazard_mode=hazard_mode,
         hazard_snap_n=hazard_snap_n,
         hazard_snap_gap_sec=hazard_snap_gap,
+        max_client_rank=max_client_rank,
     )
     if tp_ladder:
         parts = []

@@ -26,7 +26,10 @@
 | 相对最好 age 切片 | **30–45** PF=0.84 仍微负 late — 仅可另开单变量对照 |
 | 其它线索 | `client_rank>0` TP%=0；极低 liq→死盘，高 liq→lp_drop |
 
-**下一工程刀：** (1) ~~buy 事件落盘 hazard_*/sell_ladder~~ **已实现** `gate_audit_fields` → buy/shadow/reject（需部署 rn2 后重采才能测区分力）(2) 机会集/rank0 或买前动量确认 — 不是 age60 复辟。
+**下一工程刀（已落地）：**  
+1. `gate_audit_fields` on buy/shadow/reject  
+2. `--max-client-rank 0` + `run_paper_ev3_rank0.sh`（单变量对照，新日志 `trades.paper_ev3_rank0.jsonl`）  
+3. rn2 部署后停 paper_ev2、起 paper_ev3_rank0（hazard 仍 shadow，不 enforce）
 
 补充：
 

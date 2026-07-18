@@ -81,7 +81,8 @@ age 30-45 / 45-60 / 60-75 / 75-90
 - ALL: n≈209, WR≈11%, PF≈0.40, net≈-0.0079 ETH  
 - 30–60 PF=0.65 (not ≥1) → **no age60**  
 - hazard keys missing on historical buys → **unmeasurable**; fixed by `gate_audit_fields` on buy  
-- max_hold MFE p50=0% → **do not lower TP**
+- max_hold MFE p50=0% → **do not lower TP**  
+- client_rank>0 TP%≈0 → single-var follow-up: `--max-client-rank 0` / `run_paper_ev3_rank0.sh`
 
 ---
 
@@ -98,7 +99,7 @@ age 30-45 / 45-60 / 60-75 / 75-90
 
 ## Good / Base / Bad
 
-**Good:** single-variable paper (`paper_ev3_*`) with frozen exits  
+**Good:** single-variable paper (`paper_ev3_rank0`, …) with frozen exits + new log names  
 **Base:** offline report only, no cmdline change  
 **Bad:** multi-knob retune after one negative paper; live while PF<1  
 

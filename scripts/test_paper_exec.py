@@ -75,6 +75,16 @@ def test_hard_sl() -> None:
     assert ratio == 100.0
 
 
+def test_max_client_rank() -> None:
+    from rh_sniper.engine import pre_entry_gate
+
+    cfg = Config(wallet="0x0", max_client_rank=0)
+    ok, reason, _ = pre_entry_gate(cfg, {"address": "0xabc", "_client_rank": 2})
+    assert ok is False and reason.startswith("client_rank:")
+    # missing rank is not rejected (unknown)
+    # would proceed past rank check into snapshot — skip full gate
+
+
 def test_gate_audit_fields() -> None:
     snap = {
         "age": 44,
@@ -125,6 +135,7 @@ if __name__ == "__main__":
     test_hard_sl()
     test_partial_and_inventory()
     test_gate_audit_fields()
+    test_max_client_rank()
     test_hazard_liq()
     test_hazard_depth()
     print("test_paper_exec OK")

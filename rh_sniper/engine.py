@@ -188,6 +188,8 @@ class Config:
     hazard_max_full_exit_loss_pct: float = 5.0
     hazard_max_impact_spread_pct: float = 4.0
     hazard_max_quote_jitter_pct: float = 5.0
+    # None = no cap; 0 = client_rank 0 only (paper_ev2: rank>0 TP%=0)
+    max_client_rank: int | None = None
 
 
 def configure_runtime(cfg: Config) -> None:
@@ -829,6 +831,10 @@ def gate_audit_fields(snap: dict | None) -> dict:
 
 def pre_entry_gate(cfg: Config, token: dict) -> tuple[bool, str, dict]:
     addr = token["address"]
+    if cfg.max_client_rank is not None:
+        cr = token.get("_client_rank")
+        if cr is not None and int(cr) > int(cfg.max_client_rank):
+            return False, f"client_rank:{cr}>{cfg.max_client_rank}", {}
     lp = (token.get("_lp") or token.get("launchpad") or token.get("launchpad_platform") or "").lower()
     if not lp_allowed(cfg, lp):
         return False, f"unsafe_lp:{lp or 'unknown'}", {}
@@ -1492,7 +1498,8 @@ def loop(cfg: Config) -> None:
     print(
         f"[filters] lps={','.join(allowed_lp_names(cfg))} min_age={cfg.fresh_min_age_sec}s "
         f"max_age={cfg.fresh_max_age_sec}s unindexed_liq={cfg.allow_unindexed_liq} "
-        f"shadow={cfg.shadow_collect} hazard={cfg.hazard_mode} scan_log={cfg.scan_log_enabled}",
+        f"shadow={cfg.shadow_collect} hazard={cfg.hazard_mode} scan_log={cfg.scan_log_enabled} "
+        f"max_client_rank={cfg.max_client_rank}",
         flush=True,
     )
 
@@ -1967,6 +1974,7 @@ def build_config(
     hazard_mode: str = "off",
     hazard_snap_n: int | None = None,
     hazard_snap_gap_sec: float | None = None,
+    max_client_rank: int | None = None,
 ) -> Config:
     cfg = Config(
         wallet=wallet or os.environ.get("GMGN_WALLET", "0x37e9f4a84693bce7f7729612ee91a94c91eef898"),
@@ -2004,6 +2012,7 @@ def build_config(
         shadow_collect=shadow_collect,
         scan_log_enabled=scan_log_enabled,
         hazard_mode=(hazard_mode or "off").lower(),
+        max_client_rank=max_client_rank,
     )
     apply_profile(cfg, profile, buy_eth)
     if exit_mode:
@@ -2051,6 +2060,8 @@ def build_config(
         cfg.hazard_snap_n = max(1, int(hazard_snap_n))
     if hazard_snap_gap_sec is not None:
         cfg.hazard_snap_gap_sec = max(0.2, float(hazard_snap_gap_sec))
+    if max_client_rank is not None:
+        cfg.max_client_rank = max(0, int(max_client_rank))
     if cfg.hazard_mode not in ("off", "shadow", "enforce"):
         cfg.hazard_mode = "off"
     # CLI risk exits must win over profile defaults
