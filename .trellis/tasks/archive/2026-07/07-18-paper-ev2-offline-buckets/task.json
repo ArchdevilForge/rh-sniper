@@ -1,0 +1,30 @@
+{
+  "id": "paper-ev2-offline-buckets",
+  "name": "paper-ev2-offline-buckets",
+  "title": "paper_ev2 offline buckets + gate decision",
+  "description": "",
+  "status": "completed",
+  "dev_type": null,
+  "scope": null,
+  "package": null,
+  "priority": "P2",
+  "creator": "xeron",
+  "assignee": "xeron",
+  "createdAt": "2026-07-18",
+  "completedAt": "2026-07-18",
+  "branch": null,
+  "base_branch": "main",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [],
+  "parent": null,
+  "relatedFiles": [
+    "scripts/paper_ev2_buckets.py",
+    "docs/HANDOFF_PAPER_EV2_DILEMMA.md",
+    "data/paper_ev2/trades.paper_ev2.jsonl"
+  ],
+  "notes": "\nDONE offline buckets: NO age60, hazard unmeasurable, no TP/hold change. See research/offline_buckets.md",
+  "meta": {}
+}
